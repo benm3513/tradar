@@ -1,0 +1,43 @@
+env: paper
+exchange: binance_spot_testnet
+
+symbol_registry:
+  enabled: true
+  poll_interval_s: 15
+  quote_asset: USDT
+  status: TRADING
+  allowlist:
+    - BTCUSDT
+    - ETHUSDT
+    - BNBUSDT
+  denylist: []
+  emit_listing_events: true
+
+ws:
+  shard_size: 60
+  stream_types:
+    - bookTicker
+  reconnect_backoff_s: [1, 2, 5, 10, 30]
+
+runtime:
+  candle_interval_s: 1
+  log_level: INFO
+
+execution:
+  fee_bps: 10
+  entry_slippage_cap_pct: 0.0025
+  exit_slippage_cap_pct: 0.0025
+  max_spread_pct: 0.01
+
+risk:
+  max_positions: 2
+  cooldown_s: 300
+
+strategies:
+  algo2_micro_momentum:
+    enabled: true
+    price_cap: 0.01          # set to null if testnet has no <0.01 symbols
+    min_move_bps: 0.0005
+    stop_pct: 0.01
+    take_profit_pct: 0.01
+    notional_fraction: 0.05
