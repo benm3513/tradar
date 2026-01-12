@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 from typing import Any, Dict, Set
 
 import yaml
@@ -7,7 +8,7 @@ import yaml
 from tradarbot.app.context import Ctx
 from tradarbot.core.bus import EventBus
 from tradarbot.core.engine import StrategyEngine
-from tradarbot.core.events import CandleEvent, ListingEvent
+from tradarbot.core.events import CandleEvent, ListingEvent, BookEvent
 from tradarbot.core.state import State
 from tradarbot.data.candles import CandleBuilder1s
 from tradarbot.data.symbol_registry import SymbolRegistry
@@ -77,9 +78,14 @@ async def main() -> None:
     candle_builder = CandleBuilder1s(emit_fn=emit_candle)
 
     # Exchange clients
-    rest = BinanceRestClient()
+    bcfg = cfg.get("binance", {})
+    rest = BinanceRestClient(
+        rest_base_url=bcfg.get("rest_base_url", "https://testnet.binance.vision/api"),
+        exchange_info_url=bcfg.get("exchange_info_url"),
+    )
     ws_mgr = BinanceWSManager(cfg=cfg, on_book=lambda be: _on_book(ctx, candle_builder, be))
-
+    ctx.state._book_count = 0
+    ctx.state._last_book_log = time.time()
     # Symbol registry -> updates WS subscriptions
     registry_cfg = cfg.get("symbol_registry", {})
     symbol_registry = SymbolRegistry(rest=rest, cfg=registry_cfg, bus=bus)
@@ -88,8 +94,51 @@ async def main() -> None:
         async for symbols in symbol_registry.run():
             await ws_mgr.set_symbols(symbols)
 
-    async def ws_loop():
-        await ws_mgr.run_forever()
+    async def rest_poll_loop():
+        interval = float(cfg.get("rest_poll", {}).get("interval_s", 0.5))
+        endpoint = cfg.get("rest_poll", {}).get("endpoint", "ticker_book")
+        symbols: Set[str] = set()
+
+        # a task that updates symbols from registry
+        async def updater():
+            nonlocal symbols
+            async for symset in symbol_registry.run():
+                symbols = set(symset)
+                log.info("REST poll universe symbols=%d", len(symbols))
+
+        asyncio.create_task(updater(), name="symbol_updater")
+
+        while True:
+            if not symbols:
+                await asyncio.sleep(1.0)
+                continue
+
+            # Poll each symbol (starter). Later: batch + rate-limit.
+            for s in list(symbols):
+                try:
+                    ts_ms = int(time.time() * 1000)
+                    if endpoint == "ticker_price":
+                        data = await rest.ticker_price(s)
+                        px = float(data["price"])
+                        bid = px
+                        ask = px
+                    else:
+                        data = await rest.ticker_book(s)
+                        bid = float(data["bidPrice"])
+                        ask = float(data["askPrice"])
+
+                    be = BookEvent(symbol=s, ts_ms=ts_ms, bid=bid, ask=ask)
+                    _on_book(ctx, candle_builder, be)
+
+                except Exception:
+                    # don't spam; you can add a counter later
+                    continue
+
+            await asyncio.sleep(interval)
+        
+
+    #async def ws_loop():
+        #await ws_mgr.run_forever()
 
     async def status_loop():
         while True:
@@ -99,8 +148,7 @@ async def main() -> None:
 
     tasks = [
         asyncio.create_task(bus.run(), name="event_bus"),
-        asyncio.create_task(registry_loop(), name="symbol_registry"),
-        asyncio.create_task(ws_loop(), name="ws_manager"),
+        asyncio.create_task(rest_poll_loop(), name="rest_poll"),
         asyncio.create_task(status_loop(), name="status"),
     ]
 
@@ -129,3 +177,21 @@ def _on_book(ctx: Ctx, candle_builder: CandleBuilder1s, book_event) -> None:
 
     # Persist latest book snapshot (optional)
     ctx.store.upsert_book(book_event.symbol, book_event.ts_ms, book_event.bid, book_event.ask)
+
+    ctx.state._book_count += 1
+    now = time.time()
+    if now -ctx.state._last_book_log >= 5:
+        logging.getLogger("tradarbot").info(
+            "book events=%d last=%s ask=%s",
+            ctx.state._book_count,
+            book_event.symbol,
+            book_event.bid,
+            book_event.ask,
+        )
+    ctx.state._book_count = 0
+    ctx.state._last_book_log = now
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())

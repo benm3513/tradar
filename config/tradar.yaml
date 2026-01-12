@@ -1,3 +1,13 @@
+data_source: rest_poll  # rest_poll or ws
+
+rest_poll:
+  interval_s: 0.5        # 2 Hz per symbol batch
+  endpoint: ticker_book  # ticker_book or ticker_price
+
+binance:
+  rest_base_url: "https://testnet.binance.vision/api"
+  exchange_info_url: "https://api.binance.us/api/v3/exchangeInfo"
+  ws_base_url: "wss://testnet.binance.vision"
 env: paper
 exchange: binance_spot_testnet
 

@@ -52,7 +52,7 @@ class BinanceWSManager:
     def __init__(self, cfg: Dict[str, Any], on_book: Callable[[BookEvent], None]):
         self.cfg = cfg
         self.on_book = on_book
-        self.ws_base = "wss://stream.testnet.binance.vision"
+        self.ws_base = cfg.get("binance", {}).get("ws_base_url", "wss://testnet.binance.vision").rstrip("/")
         self.shard_size = int(cfg.get("ws", {}).get("shard_size", 60))
         self.stream_types = cfg.get("ws", {}).get("stream_types", ["bookTicker"])
 
