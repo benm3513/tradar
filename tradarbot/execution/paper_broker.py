@@ -1,7 +1,9 @@
 from dataclasses import dataclass
 from typing import Dict
-
+import logging
 from tradarbot.core.events import OrderIntent
+
+log = logging.getLogger("tradarbot.broker")
 
 @dataclass
 class Position:
@@ -39,6 +41,10 @@ class PaperBroker:
             pos.qty = new_qty
             self.positions[intent.symbol] = pos
             ctx.store.insert_fill(intent.symbol, "BUY", intent.qty, fill_px)
+            log.info(
+                "FILLED BUY %s qty=%.8f px=%.2f fee_bps=%.1f cash=%.2f",
+                intent.symbol, intent.qty, fill_px, self.fee_bps, self.cash
+            )
 
         elif intent.side == "SELL":
             pos = self.positions.get(intent.symbol)
@@ -53,6 +59,10 @@ class PaperBroker:
             self.cash += proceeds
             pos.qty -= sell_qty
             ctx.store.insert_fill(intent.symbol, "SELL", sell_qty, fill_px)
+            log.info(
+                "FILLED SELL %s qty=%.8f px=%.2f fee_bps=%.1f cash=%.2f",
+                intent.symbol, sell_qty, fill_px, self.fee_bps, self.cash
+            )
 
             if pos.qty <= 1e-12:
                 self.positions.pop(intent.symbol, None)

@@ -5,9 +5,9 @@ rest_poll:
   endpoint: ticker_book  # ticker_book or ticker_price
 
 binance:
-  rest_base_url: "https://testnet.binance.vision/api"
+  data_rest_base_url: "https://api.binance.us/api"
+  exec_rest_base_url: "https://testnet.binance.vision/api"
   exchange_info_url: "https://api.binance.us/api/v3/exchangeInfo"
-  ws_base_url: "wss://testnet.binance.vision"
 env: paper
 exchange: binance_spot_testnet
 
@@ -46,8 +46,8 @@ risk:
 strategies:
   algo2_micro_momentum:
     enabled: true
-    price_cap: 0.01          # set to null if testnet has no <0.01 symbols
-    min_move_bps: 0.0005
+    price_cap: null         # set to null if testnet has no <0.01 symbols
+    min_move_bps: 0.00002
     stop_pct: 0.01
     take_profit_pct: 0.01
     notional_fraction: 0.05

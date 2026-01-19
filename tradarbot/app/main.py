@@ -32,6 +32,7 @@ async def main() -> None:
     cfg: Dict[str, Any] = yaml.safe_load(open("config/tradar.yaml", "r"))
     setup_logging(cfg.get("runtime", {}).get("log_level", "INFO"))
     log = logging.getLogger("tradarbot")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     log.info("Booting...")
 
     # Core components
@@ -47,6 +48,10 @@ async def main() -> None:
 
     ctx = Ctx(cfg=cfg, state=state, store=store, broker=broker, risk=risk)
 
+    ctx.state.active_symbols = set()
+
+    ctx.state._candle_count = 0
+    ctx.state._last_candle_log = time.time()
     bus = EventBus()
 
     # Strategies
@@ -74,25 +79,29 @@ async def main() -> None:
             volume=candle.volume,
         )
         bus.publish(ev)
+        ctx.state._candle_count += 1
+        now = time.time()
+        if now - ctx.state._last_candle_log >= 10:
+            log.info("candles emitted in last 10s=%d", ctx.state._candle_count)
+            ctx.state._candle_count = 0
+            ctx.state._last_candle_log = now
 
     candle_builder = CandleBuilder1s(emit_fn=emit_candle)
 
     # Exchange clients
     bcfg = cfg.get("binance", {})
     rest = BinanceRestClient(
-        rest_base_url=bcfg.get("rest_base_url", "https://testnet.binance.vision/api"),
-        exchange_info_url=bcfg.get("exchange_info_url"),
+        data_rest_base_url=bcfg.get("data_rest_base_url", "https://api.binance.us/api"),
+        exec_rest_base_url=bcfg.get("exec_rest_base_url", "https://testnet.binance.vision/api"),
+        exchange_info_url=bcfg.get("exchange_info_url", "https://api.binance.us/api/v3/exchangeInfo"),
     )
-    ws_mgr = BinanceWSManager(cfg=cfg, on_book=lambda be: _on_book(ctx, candle_builder, be))
+    log.info("DATA base_url=%s EXEC base_url=%s", rest.data_rest_base_url, rest.exec_rest_base_url)
     ctx.state._book_count = 0
     ctx.state._last_book_log = time.time()
     # Symbol registry -> updates WS subscriptions
     registry_cfg = cfg.get("symbol_registry", {})
     symbol_registry = SymbolRegistry(rest=rest, cfg=registry_cfg, bus=bus)
 
-    async def registry_loop():
-        async for symbols in symbol_registry.run():
-            await ws_mgr.set_symbols(symbols)
 
     async def rest_poll_loop():
         interval = float(cfg.get("rest_poll", {}).get("interval_s", 0.5))
@@ -104,6 +113,7 @@ async def main() -> None:
             nonlocal symbols
             async for symset in symbol_registry.run():
                 symbols = set(symset)
+                ctx.state.active_symbols = set(symset)
                 log.info("REST poll universe symbols=%d", len(symbols))
 
         asyncio.create_task(updater(), name="symbol_updater")
@@ -130,8 +140,13 @@ async def main() -> None:
                     be = BookEvent(symbol=s, ts_ms=ts_ms, bid=bid, ask=ask)
                     _on_book(ctx, candle_builder, be)
 
-                except Exception:
-                    # don't spam; you can add a counter later
+                except Exception as e:
+                    # Throttle error logging so we don't spam
+                    if not hasattr(ctx.state, "_last_poll_err"):
+                        ctx.state._last_poll_err = 0.0
+                    if time.time() - ctx.state._last_poll_err > 5:
+                        log.warning("REST poll failed for %s: %s", s, e)
+                        ctx.state._last_poll_err = time.time()
                     continue
 
             await asyncio.sleep(interval)
@@ -142,9 +157,11 @@ async def main() -> None:
 
     async def status_loop():
         while True:
+            sym_count = len(getattr(ctx.state, "active_symbols", set()))
             log.info("cash=%.2f positions=%s symbols=%d",
-                     broker.cash, broker.positions_snapshot(), len(ws_mgr.current_symbols))
+                    broker.cash, broker.positions_snapshot(), sym_count)
             await asyncio.sleep(5)
+
 
     tasks = [
         asyncio.create_task(bus.run(), name="event_bus"),
@@ -158,6 +175,7 @@ async def main() -> None:
         log.warning("Shutting down...")
         for t in tasks:
             t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def _on_book(ctx: Ctx, candle_builder: CandleBuilder1s, book_event) -> None:
@@ -180,16 +198,16 @@ def _on_book(ctx: Ctx, candle_builder: CandleBuilder1s, book_event) -> None:
 
     ctx.state._book_count += 1
     now = time.time()
-    if now -ctx.state._last_book_log >= 5:
+    if now - ctx.state._last_book_log >= 5:
         logging.getLogger("tradarbot").info(
-            "book events=%d last=%s ask=%s",
+            "book events=%d last=%s bid=%s ask=%s",
             ctx.state._book_count,
             book_event.symbol,
             book_event.bid,
             book_event.ask,
         )
-    ctx.state._book_count = 0
-    ctx.state._last_book_log = now
+        ctx.state._book_count = 0
+        ctx.state._last_book_log = now
 
 
 if __name__ == "__main__":
