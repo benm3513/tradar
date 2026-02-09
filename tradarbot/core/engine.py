@@ -25,9 +25,16 @@ class StrategyEngine:
             intents = strat.on_candle(ev, self.ctx) or []
             self._handle_intents(intents, strat.name)
 
-    def _handle_intents(self, intents: List[OrderIntent], strat_name: str) -> None:
+    def _handle_intents(self, intents, strat_name: str) -> None:
         for intent in intents:
             decision = self.risk.check(intent, self.ctx, strat_name)
             if not decision["approved"]:
-                return
+                # helpful for replay/backtest debugging
+                import logging
+                logging.getLogger("tradarbot.engine").info(
+                    "REJECT %s %s %s reason=%s",
+                    strat_name, intent.side, intent.symbol, decision.get("reason")
+                )
+                continue
             self.broker.execute_intent(decision["intent"], self.ctx)
+

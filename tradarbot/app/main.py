@@ -158,9 +158,21 @@ async def main() -> None:
     async def status_loop():
         while True:
             sym_count = len(getattr(ctx.state, "active_symbols", set()))
-            log.info("cash=%.2f positions=%s symbols=%d",
-                    broker.cash, broker.positions_snapshot(), sym_count)
+
+            # mark-to-market equity
+            equity = broker.cash
+            for sym, pos in broker.positions.items():
+                ms = ctx.state.market.get(sym)
+                if ms and ms.bid is not None and ms.ask is not None:
+                    mid = (ms.bid + ms.ask) / 2.0
+                    equity += pos.qty * mid
+    
+            log.info(
+                "cash=%.2f equity=%.2f positions=%s symbols=%d",
+                broker.cash, equity, broker.positions_snapshot(), sym_count
+            )
             await asyncio.sleep(5)
+
 
 
     tasks = [
