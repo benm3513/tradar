@@ -35,23 +35,45 @@ runtime:
   candle_interval_s: 1
   log_level: INFO
 
+#execution:
+  #fee_bps: 10
+  #entry_slippage_cap_pct: 0.0025
+  #exit_slippage_cap_pct: 0.0025
+  #max_spread_pct: 0.01
+
+risk:
+  max_positions: 3
+  cooldown_s: 0
+  max_notional_per_trade_usd: 2000
+  max_position_notional_usd: 3000
+  max_daily_loss_usd: 100000
+  max_orders_per_minute: 9999
+
 execution:
   fee_bps: 10
   entry_slippage_cap_pct: 0.0025
   exit_slippage_cap_pct: 0.0025
-  max_spread_pct: 0.01
-
-risk:
-  max_positions: 2
-  cooldown_s: 300
-
+  max_spread_pct: 0.02
+  
 strategies:
+  algo1_new_listing_pump:
+    enabled: false
+    max_listing_age_s: 300
+    pump_trigger_bps: 20
+    take_profit_bps: 40
+    stop_bps: 20
+    exhaustion_reversal_bps: 10
+    max_hold_s: 120
+    notional_fraction: 0.10
+    price_cap: null
+    max_spread_pct: 0.02
+    
   algo2_micro_momentum:
     enabled: true
-    price_cap: null         # set to null if testnet has no <0.01 symbols
     min_move_bps: 1
-    stop_bps: 5
     take_profit_bps: 5
-    stop_pct: 0.01
-    take_profit_pct: 0.01
+    stop_bps: 5
+    max_hold_s: 60
     notional_fraction: 0.05
+    price_cap: null
+

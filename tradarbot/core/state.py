@@ -11,6 +11,7 @@ class MarketState:
 class State:
     def __init__(self):
         self.market: Dict[str, MarketState] = {}
+        self.listings: Dict[str, int] = {}  
 
     @staticmethod
     def market_state_factory() -> MarketState:

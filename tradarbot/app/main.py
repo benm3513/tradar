@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import time
+import httpx
 from typing import Any, Dict, Set
 
 import yaml
@@ -18,6 +19,7 @@ from tradarbot.execution.paper_broker import PaperBroker
 from tradarbot.risk.risk_manager import RiskManager
 from tradarbot.storage.sqlite_store import SQLiteStore
 from tradarbot.strategies.algo2_micro_momentum import Algo2MicroMomentum
+from tradarbot.strategies.algo1_new_listing_pump import Algo1NewListingPump
 
 
 def setup_logging(level: str) -> None:
@@ -50,15 +52,25 @@ async def main() -> None:
 
     ctx.state.active_symbols = set()
 
+    ctx.state._poll_ok = 0
+    ctx.state._poll_err = 0
+    ctx.state._poll_backoff_s = 0.0
+
+
     ctx.state._candle_count = 0
     ctx.state._last_candle_log = time.time()
     bus = EventBus()
 
     # Strategies
     strategies = []
-    s_cfg = cfg.get("strategies", {}).get("algo2_micro_momentum", {})
-    if s_cfg.get("enabled", False):
-        strategies.append(Algo2MicroMomentum(s_cfg))
+
+    algo1_cfg = cfg.get("strategies", {}).get("algo1_new_listing_pump", {})
+    if algo1_cfg.get("enabled", False):
+        strategies.append(Algo1NewListingPump(algo1_cfg))
+
+    algo2_cfg = cfg.get("strategies", {}).get("algo2_micro_momentum", {})
+    if algo2_cfg.get("enabled", False):
+        strategies.append(Algo2MicroMomentum(algo2_cfg))
 
     engine = StrategyEngine(strategies=strategies, risk=risk, broker=broker, ctx=ctx)
 
@@ -108,7 +120,6 @@ async def main() -> None:
         endpoint = cfg.get("rest_poll", {}).get("endpoint", "ticker_book")
         symbols: Set[str] = set()
 
-        # a task that updates symbols from registry
         async def updater():
             nonlocal symbols
             async for symset in symbol_registry.run():
@@ -118,15 +129,23 @@ async def main() -> None:
 
         asyncio.create_task(updater(), name="symbol_updater")
 
+        last_err_log = 0.0
+        backoff = 0.0
+
         while True:
             if not symbols:
                 await asyncio.sleep(1.0)
                 continue
 
-            # Poll each symbol (starter). Later: batch + rate-limit.
+            if backoff > 0:
+                await asyncio.sleep(backoff)
+
+            any_429 = False
+
             for s in list(symbols):
                 try:
                     ts_ms = int(time.time() * 1000)
+
                     if endpoint == "ticker_price":
                         data = await rest.ticker_price(s)
                         px = float(data["price"])
@@ -139,40 +158,68 @@ async def main() -> None:
 
                     be = BookEvent(symbol=s, ts_ms=ts_ms, bid=bid, ask=ask)
                     _on_book(ctx, candle_builder, be)
+                    ctx.state._poll_ok += 1
 
-                except Exception as e:
-                    # Throttle error logging so we don't spam
-                    if not hasattr(ctx.state, "_last_poll_err"):
-                        ctx.state._last_poll_err = 0.0
-                    if time.time() - ctx.state._last_poll_err > 5:
-                        log.warning("REST poll failed for %s: %s", s, e)
-                        ctx.state._last_poll_err = time.time()
+                except httpx.HTTPStatusError as e:
+                    ctx.state._poll_err += 1
+                    status = e.response.status_code if e.response is not None else None
+                    if status in (418, 429):
+                        any_429 = True
+                    now = time.time()
+                    if now - last_err_log > 5:
+                        log.warning("REST poll HTTP error symbol=%s status=%s", s, status)
+                        last_err_log = now
                     continue
 
-            await asyncio.sleep(interval)
-        
+                except Exception as e:
+                    ctx.state._poll_err += 1
+                    now = time.time()
+                    if now - last_err_log > 5:
+                        log.warning("REST poll failed symbol=%s err=%s", s, e)
+                        last_err_log = now
+                    continue
 
-    #async def ws_loop():
-        #await ws_mgr.run_forever()
+            # Backoff policy
+            if any_429:
+                backoff = min(10.0, backoff * 2.0 if backoff > 0 else 1.0)
+            else:
+                backoff = max(0.0, backoff - 0.5)
+
+            ctx.state._poll_backoff_s = backoff
+            await asyncio.sleep(interval)
+
 
     async def status_loop():
         while True:
             sym_count = len(getattr(ctx.state, "active_symbols", set()))
 
-            # mark-to-market equity
-            equity = broker.cash
-            for sym, pos in broker.positions.items():
-                ms = ctx.state.market.get(sym)
-                if ms and ms.bid is not None and ms.ask is not None:
-                    mid = (ms.bid + ms.ask) / 2.0
-                    equity += pos.qty * mid
-    
+            unrealized = broker.unrealized_pnl(ctx.state)
+            equity = broker.equity(ctx.state)
+
+            m = broker.metrics_snapshot()
             log.info(
-                "cash=%.2f equity=%.2f positions=%s symbols=%d",
-                broker.cash, equity, broker.positions_snapshot(), sym_count
+                "cash=%.2f equity=%.2f pnl=%.2f trades=%d W/L=%d/%d avg_hold=%.1fs symbols=%d poll_ok=%d poll_err=%d backoff=%.1fs",
+                broker.cash,
+                equity,
+                m["realized_pnl"],
+                m["trades"],
+                m["wins"],
+                m["losses"],
+                m["avg_hold_s"],
+                sym_count,
+                getattr(ctx.state, "_poll_ok", 0),
+                getattr(ctx.state, "_poll_err", 0),
+                getattr(ctx.state, "_poll_backoff_s", 0.0),
+            )
+            ctx.store.insert_equity_snapshot(
+                ts_ms=int(time.time() * 1000),
+                cash=broker.cash,
+                realized_pnl=broker.realized_pnl,
+                unrealized_pnl=unrealized,
+                equity=equity,
+                mode="live",
             )
             await asyncio.sleep(5)
-
 
 
     tasks = [
@@ -184,10 +231,13 @@ async def main() -> None:
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
-        log.warning("Shutting down...")
+        log.warning("Shutting down... flattening positions")
+        broker.close_all(ctx, reason="SHUTDOWN")
+
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
 
 
 def _on_book(ctx: Ctx, candle_builder: CandleBuilder1s, book_event) -> None:

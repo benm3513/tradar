@@ -5,6 +5,10 @@ from tradarbot.core.events import CandleEvent, ListingEvent, OrderIntent
 
 log = logging.getLogger("tradar.engine")
 
+import logging
+
+log = logging.getLogger("tradarbot.engine")
+
 class StrategyEngine:
     def __init__(self, strategies, risk, broker, ctx):
         self.strategies = strategies
@@ -13,13 +17,14 @@ class StrategyEngine:
         self.ctx = ctx
 
     def on_listing(self, ev: ListingEvent):
+        self.ctx.state.listings.setdefault(ev.symbol, int(ev.ts_ms))
         for strat in self.strategies:
             fn = getattr(strat, "on_listing", None)
             if callable(fn):
                 intents = fn(ev, self.ctx) or []
                 self._handle_intents(intents, strat.name)
 
-    def on_candle(self, ev: CandleEvent):
+    def on_candle(self, ev):
         self.ctx.store.insert_candle(ev)
         for strat in self.strategies:
             intents = strat.on_candle(ev, self.ctx) or []
@@ -29,12 +34,12 @@ class StrategyEngine:
         for intent in intents:
             decision = self.risk.check(intent, self.ctx, strat_name)
             if not decision["approved"]:
-                # helpful for replay/backtest debugging
-                import logging
-                logging.getLogger("tradarbot.engine").info(
-                    "REJECT %s %s %s reason=%s",
-                    strat_name, intent.side, intent.symbol, decision.get("reason")
+                log.info(
+                    "REJECT strat=%s side=%s sym=%s reason=%s",
+                    strat_name,
+                    intent.side,
+                    intent.symbol,
+                    decision.get("reason"),
                 )
                 continue
             self.broker.execute_intent(decision["intent"], self.ctx)
-
