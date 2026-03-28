@@ -2,17 +2,18 @@ import argparse
 import heapq
 import sqlite3
 import time
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Tuple
 
 import yaml
 
 from tradarbot.app.context import Ctx
 from tradarbot.core.engine import StrategyEngine
-from tradarbot.core.events import CandleEvent
+from tradarbot.core.events import CandleEvent, ListingEvent
 from tradarbot.core.state import State
 from tradarbot.execution.paper_broker import PaperBroker
 from tradarbot.risk.risk_manager import RiskManager
 from tradarbot.storage.sqlite_store import SQLiteStore
+from tradarbot.strategies.algo1_new_listing_pump import Algo1NewListingPump
 from tradarbot.strategies.algo2_micro_momentum import Algo2MicroMomentum
 
 
@@ -25,7 +26,13 @@ def list_symbols_in_db(db_path: str) -> List[str]:
     return out
 
 
-def iter_candles(db_path: str, symbol: str, interval_s: int, start_ms: int, end_ms: int) -> Iterator[CandleEvent]:
+def iter_candles(
+    db_path: str,
+    symbol: str,
+    interval_s: int,
+    start_ms: int,
+    end_ms: int,
+) -> Iterator[CandleEvent]:
     conn = sqlite3.connect(db_path)
     cur = conn.cursor()
     cur.execute(
@@ -41,7 +48,16 @@ def iter_candles(db_path: str, symbol: str, interval_s: int, start_ms: int, end_
     conn.close()
 
     for ts_ms, o, h, l, c, v in rows:
-        yield CandleEvent(symbol=symbol, interval_s=interval_s, ts_ms=ts_ms, open=o, high=h, low=l, close=c, volume=v)
+        yield CandleEvent(
+            symbol=symbol,
+            interval_s=interval_s,
+            ts_ms=ts_ms,
+            open=o,
+            high=h,
+            low=l,
+            close=c,
+            volume=v,
+        )
 
 
 def merge_streams(streams: Dict[str, Iterator[CandleEvent]]) -> Iterator[CandleEvent]:
@@ -66,15 +82,6 @@ def merge_streams(streams: Dict[str, Iterator[CandleEvent]]) -> Iterator[CandleE
         except StopIteration:
             pass
 
-
-def mark_to_market(broker: PaperBroker, state: State) -> float:
-    equity = broker.cash
-    for sym, pos in broker.positions.items():
-        ms = state.market.get(sym)
-        if ms and ms.bid is not None and ms.ask is not None:
-            mid = (ms.bid + ms.ask) / 2.0
-            equity += pos.qty * mid
-    return equity
 
 def run_replay(
     config_path: str,
@@ -104,9 +111,14 @@ def run_replay(
     ctx = Ctx(cfg=cfg, state=state, store=store, broker=broker, risk=risk)
 
     strategies = []
-    s_cfg = cfg.get("strategies", {}).get("algo2_micro_momentum", {})
-    if s_cfg.get("enabled", False):
-        strategies.append(Algo2MicroMomentum(s_cfg))
+
+    algo1_cfg = cfg.get("strategies", {}).get("algo1_new_listing_pump", {})
+    if algo1_cfg.get("enabled", False):
+        strategies.append(Algo1NewListingPump(algo1_cfg))
+
+    algo2_cfg = cfg.get("strategies", {}).get("algo2_micro_momentum", {})
+    if algo2_cfg.get("enabled", False):
+        strategies.append(Algo2MicroMomentum(algo2_cfg))
 
     engine = StrategyEngine(strategies=strategies, risk=risk, broker=broker, ctx=ctx)
     interval_s = int(cfg["runtime"]["candle_interval_s"])
@@ -126,6 +138,7 @@ def run_replay(
     t0 = time.time()
     for ev in merge_streams(streams):
         last_ts_ms = int(ev.ts_ms)
+        candles += 1
 
         ms = state.market.setdefault(ev.symbol, state.market_state_factory())
         mid = float(ev.close)
@@ -135,8 +148,10 @@ def run_replay(
         ms.last = mid
         ms.last_ts_ms = int(ev.ts_ms)
 
+        if ev.symbol not in state.listings:
+            engine.on_listing(ListingEvent(symbol=ev.symbol, ts_ms=int(ev.ts_ms)))
+
         engine.on_candle(ev)
-        candles += 1
 
         unrealized = broker.unrealized_pnl(state)
         equity = broker.equity(state)
@@ -166,6 +181,7 @@ def run_replay(
 
     if liquidate_end and last_ts_ms is not None:
         broker.close_all(ctx, reason="REPLAY_END")
+
         unrealized = broker.unrealized_pnl(state)
         equity = broker.equity(state)
         peak_equity = max(peak_equity, equity)
@@ -228,35 +244,8 @@ def main():
     ap.add_argument("--end_ms", type=int, required=True)
     ap.add_argument("--liquidate_end", action="store_true", help="Flatten all positions at end of replay")
     ap.add_argument("--synthetic_spread_bps", type=float, default=1.0, help="Bid/ask synthetic spread for replay")
+    ap.add_argument("--persist_equity", action="store_true", help="Persist replay equity snapshots")
     args = ap.parse_args()
-
-    cfg = yaml.safe_load(open(args.config, "r"))
-
-    state = State()
-    store = SQLiteStore(args.db)
-    exec_cfg = cfg.get("execution", {}) or {}
-    fee_bps = exec_cfg.get("fee_bps", None)
-
-    # fallback support for alternative nesting (if you ever change config structure)
-    if fee_bps is None:
-        fee_bps = (exec_cfg.get("fees", {}) or {}).get("fee_bps", None)
-
-    # final fallback default
-    if fee_bps is None:
-        fee_bps = 10
-
-    broker = PaperBroker(fee_bps=float(fee_bps), starting_cash=10_000.0)    
-    risk = RiskManager(cfg)
-    ctx = Ctx(cfg=cfg, state=state, store=store, broker=broker, risk=risk)
-
-    strategies = []
-    s_cfg = cfg.get("strategies", {}).get("algo2_micro_momentum", {})
-    if s_cfg.get("enabled", False):
-        strategies.append(Algo2MicroMomentum(s_cfg))
-
-    engine = StrategyEngine(strategies=strategies, risk=risk, broker=broker, ctx=ctx)
-
-    interval_s = int(cfg["runtime"]["candle_interval_s"])
 
     if args.symbols:
         syms = [s.strip() for s in args.symbols.split(",") if s.strip()]
@@ -264,41 +253,6 @@ def main():
         syms = list_symbols_in_db(args.db)
     else:
         raise SystemExit("Provide --symbols or --all")
-
-    # Build iterators per symbol
-    streams = {sym: iter_candles(args.db, sym, interval_s, args.start_ms, args.end_ms) for sym in syms}
-
-    signals = 0
-    rejections = 0
-
-    start_equity = broker.cash
-    candles = 0
-    last_ts_ms = None
-
-    t0 = time.time()
-    for ev in merge_streams(streams):
-        last_ts_ms = int(ev.ts_ms)
-
-        # update market with synthetic spread
-        ms = state.market.setdefault(ev.symbol, state.market_state_factory())
-        mid = float(ev.close)
-        half = (args.synthetic_spread_bps / 10_000.0) * mid / 2.0
-        ms.bid = mid - half
-        ms.ask = mid + half
-        ms.last = mid
-        ms.last_ts_ms = int(ev.ts_ms)
-
-        engine.on_candle(ev)
-        candles += 1
-
-    # liquidate at end if requested
-    if args.liquidate_end and last_ts_ms is not None:
-        broker.close_all(ctx, reason="REPLAY_END")
-
-    elapsed = time.time() - t0
-    end_equity = mark_to_market(broker, state)
-
-    m = broker.metrics_snapshot()
 
     summary = run_replay(
         config_path=args.config,
@@ -308,7 +262,7 @@ def main():
         end_ms=args.end_ms,
         liquidate_end=args.liquidate_end,
         synthetic_spread_bps=args.synthetic_spread_bps,
-        persist_equity=False,
+        persist_equity=args.persist_equity,
     )
 
     print("----- REPLAY SUMMARY -----")

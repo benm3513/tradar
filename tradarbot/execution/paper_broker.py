@@ -63,6 +63,17 @@ class PaperBroker:
             if sym in state.market and state.market[sym].bid is not None and state.market[sym].ask is not None        
         )
 
+    def _resolve_fill_ts_ms(self, ctx, symbol: str) -> int:
+        event_ts = getattr(ctx.state, "current_event_ts_ms", None)
+        if event_ts is not None:
+            return int(event_ts)
+
+        ms = ctx.state.market.get(symbol)
+        if ms and getattr(ms, "last_ts_ms", None) is not None:
+            return int(ms.last_ts_ms)
+
+        return 0
+    
     def execute_intent(self, intent: OrderIntent, ctx) -> None:
         ms = ctx.state.market.get(intent.symbol)
         if not ms or ms.bid is None or ms.ask is None:
@@ -81,17 +92,19 @@ class PaperBroker:
 
             self.cash -= cost
 
+            fill_ts_ms = self._resolve_fill_ts_ms(ctx, intent.symbol)
+
             pos = self.positions.get(intent.symbol, Position())
             if pos.qty <= 1e-12:
-                pos.entry_ts_ms = int(getattr(ms, "last_ts_ms", 0) or 0)
+                pos.entry_ts_ms = fill_ts_ms
 
             new_qty = pos.qty + intent.qty
             pos.avg_px = (pos.avg_px * pos.qty + fill_px * intent.qty) / max(new_qty, 1e-12)
             pos.qty = new_qty
             self.positions[intent.symbol] = pos
 
-            fill_ts_ms = int(getattr(ms, "last_ts_ms", 0) or 0)
             ctx.store.insert_fill(fill_ts_ms, intent.symbol, "BUY", intent.qty, fill_px)
+            
             log.info(
                 "FILLED BUY %s qty=%.8f px=%.2f fee_bps=%.1f cash=%.2f",
                 intent.symbol, intent.qty, fill_px, self.fee_bps, self.cash
@@ -121,13 +134,13 @@ class PaperBroker:
             self.realized_pnl += net_pnl
 
             # hold time metric (only if closing entire position)
-            now_ts = int(getattr(ms, "last_ts_ms", 0) or 0)
-            if pos.entry_ts_ms is not None and now_ts > 0:
-                hold_s = max(0.0, (now_ts - pos.entry_ts_ms) / 1000.0)
+            fill_ts_ms = self._resolve_fill_ts_ms(ctx, intent.symbol)
+
+            if pos.entry_ts_ms is not None and fill_ts_ms > 0:
+                hold_s = max(0.0, (fill_ts_ms - pos.entry_ts_ms) / 1000.0)
             else:
                 hold_s = 0.0
 
-            fill_ts_ms = int(getattr(ms, "last_ts_ms", 0) or 0)
             pos.qty -= sell_qty
             ctx.store.insert_fill(fill_ts_ms, intent.symbol, "SELL", sell_qty, fill_px)
 

@@ -51,7 +51,6 @@ class Algo1NewListingPump:
         if not ms or ms.bid is None or ms.ask is None:
             return []
 
-        # spread guard
         spread_pct = (ms.ask - ms.bid) / max(ms.ask, 1e-12)
         max_spread_pct = float(
             self.cfg.get(
@@ -62,7 +61,6 @@ class Algo1NewListingPump:
         if spread_pct > max_spread_pct:
             return []
 
-        # optional price cap
         price_cap = self.cfg.get("price_cap", None)
         if price_cap is not None and e.close >= float(price_cap):
             return []
@@ -140,4 +138,5 @@ class Algo1NewListingPump:
             sym, reason, ms.bid, pos.qty
         )
         ctx.risk.set_cooldown(sym, int(ctx.cfg["risk"]["cooldown_s"]))
+        self.entry_ts_ms.pop(sym, None)
         return [OrderIntent("SELL", sym, pos.qty, limit_px)]

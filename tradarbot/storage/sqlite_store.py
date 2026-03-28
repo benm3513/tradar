@@ -25,7 +25,7 @@ class SQLiteStore:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS fills (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts_ms INTEGER NOT NULL DEFAULT (strftime('%s','now')*1000),
+          ts_ms INTEGER NOT NULL,
           symbol TEXT NOT NULL,
           side TEXT NOT NULL,
           qty REAL NOT NULL,

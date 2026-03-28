@@ -3,11 +3,8 @@ from typing import List
 
 from tradarbot.core.events import CandleEvent, ListingEvent, OrderIntent
 
-log = logging.getLogger("tradar.engine")
-
-import logging
-
 log = logging.getLogger("tradarbot.engine")
+
 
 class StrategyEngine:
     def __init__(self, strategies, risk, broker, ctx):
@@ -17,6 +14,7 @@ class StrategyEngine:
         self.ctx = ctx
 
     def on_listing(self, ev: ListingEvent):
+        self.ctx.state.current_event_ts_ms = int(ev.ts_ms)
         self.ctx.state.listings.setdefault(ev.symbol, int(ev.ts_ms))
         for strat in self.strategies:
             fn = getattr(strat, "on_listing", None)
@@ -24,13 +22,14 @@ class StrategyEngine:
                 intents = fn(ev, self.ctx) or []
                 self._handle_intents(intents, strat.name)
 
-    def on_candle(self, ev):
+    def on_candle(self, ev: CandleEvent):
+        self.ctx.state.current_event_ts_ms = int(ev.ts_ms)
         self.ctx.store.insert_candle(ev)
         for strat in self.strategies:
             intents = strat.on_candle(ev, self.ctx) or []
             self._handle_intents(intents, strat.name)
 
-    def _handle_intents(self, intents, strat_name: str) -> None:
+    def _handle_intents(self, intents: List[OrderIntent], strat_name: str) -> None:
         for intent in intents:
             decision = self.risk.check(intent, self.ctx, strat_name)
             if not decision["approved"]:

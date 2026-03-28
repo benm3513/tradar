@@ -57,19 +57,19 @@ execution:
   
 strategies:
   algo1_new_listing_pump:
-    enabled: false
+    enabled: true
     max_listing_age_s: 300
     pump_trigger_bps: 20
-    take_profit_bps: 40
+    max_spread_pct: 0.05
+    take_profit_bps: 20
     stop_bps: 20
-    exhaustion_reversal_bps: 10
+    exhaustion_reversal_bps: 5
     max_hold_s: 120
     notional_fraction: 0.10
     price_cap: null
-    max_spread_pct: 0.02
-    
+
   algo2_micro_momentum:
-    enabled: true
+    enabled: false
     min_move_bps: 1
     take_profit_bps: 5
     stop_bps: 5
