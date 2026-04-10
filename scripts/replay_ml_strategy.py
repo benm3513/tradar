@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Replay an ML-driven long-only spike strategy from saved model predictions.
 
 Research-only replay script for Phase 4/5 Tradar development.
@@ -41,6 +40,8 @@ from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+
+from tradarbot.risk.risk_manager import RiskManager
 
 LOGGER = logging.getLogger("replay_ml_strategy")
 
@@ -112,6 +113,10 @@ class ReplayDiagnostics:
     partial_take_profit_events: int = 0
     trailing_stop_exits: int = 0
     time_stop_exits: int = 0
+    daily_loss_triggered: int = 0
+    exposure_violations: int = 0
+    trades_blocked_by_risk: int = 0
+    forced_exits: int = 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -171,6 +176,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--partial-take-profit-fraction", type=float, default=0.50)
     parser.add_argument("--time-stop-hours", type=float, default=None)
     parser.add_argument("--time-stop-min-return-pct", type=float, default=0.01)
+
+    parser.add_argument("--enable-risk-manager", action="store_true")
+    parser.add_argument("--max-daily-loss-usd", type=float, default=None)
+    parser.add_argument("--max-total-exposure-usd", type=float, default=None)
+    parser.add_argument("--max-total-exposure-pct", type=float, default=None)
+    parser.add_argument("--max-exposure-per-symbol-usd", type=float, default=None)
+    parser.add_argument("--max-drawdown-pct", type=float, default=None)
+    parser.add_argument("--cooldown-minutes-per-symbol", type=float, default=0.0)
+
+    parser.add_argument("--enable-drawdown-scaling", action="store_true")
+    parser.add_argument("--drawdown-full-size-pct", type=float, default=0.04)
+    parser.add_argument("--drawdown-half-size-pct", type=float, default=0.06)
+    parser.add_argument("--drawdown-quarter-size-pct", type=float, default=0.08)
+    parser.add_argument("--drawdown-half-size-multiplier", type=float, default=0.50)
+    parser.add_argument("--drawdown-quarter-size-multiplier", type=float, default=0.25)
 
     parser.add_argument("--trades-table", default="ml_replay_trades")
     parser.add_argument("--equity-table", default="ml_replay_equity")
@@ -320,7 +340,22 @@ def compute_max_drawdown(equity: pd.Series) -> float:
         return 0.0
     running_peak = equity.cummax()
     drawdown = (equity - running_peak) / running_peak.replace(0, pd.NA)
-    return float(drawdown.min()) if not drawdown.empty else 0.0
+    return abs(float(drawdown.min())) if not drawdown.empty else 0.0
+
+
+def compute_equity_state(
+    cash: float,
+    open_positions: Dict[str, Position],
+    current_prices: Dict[str, float],
+) -> tuple[float, float, float]:
+    unrealized = 0.0
+    open_notional = 0.0
+    for symbol, pos in open_positions.items():
+        px = current_prices.get(symbol, pos.entry_price)
+        unrealized += pos.quantity * (px - pos.entry_price)
+        open_notional += pos.quantity * px
+    equity = float(cash + open_notional)
+    return float(unrealized), float(open_notional), float(equity)
 
 
 def compute_kelly_terms(pred_prob: float, args: argparse.Namespace) -> Tuple[float, float]:
@@ -480,6 +515,27 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
     if float(args.min_prob_percentile) > 0.0:
         prob_percentile_cutoff_value = float(predictions[prob_col].quantile(float(args.min_prob_percentile)))
 
+    risk_manager = RiskManager(
+        {
+            "enabled": bool(args.enable_risk_manager),
+            "max_daily_loss_usd": args.max_daily_loss_usd,
+            "max_total_exposure_usd": args.max_total_exposure_usd,
+            "max_total_exposure_pct": args.max_total_exposure_pct,
+            "max_exposure_per_symbol_usd": args.max_exposure_per_symbol_usd,
+            "max_drawdown_pct": args.max_drawdown_pct,
+            "cooldown_minutes_per_symbol": args.cooldown_minutes_per_symbol,
+            "enable_drawdown_scaling": bool(args.enable_drawdown_scaling),
+            "drawdown_full_size_pct": args.drawdown_full_size_pct,
+            "drawdown_half_size_pct": args.drawdown_half_size_pct,
+            "drawdown_quarter_size_pct": args.drawdown_quarter_size_pct,
+            "drawdown_half_size_multiplier": args.drawdown_half_size_multiplier,
+            "drawdown_quarter_size_multiplier": args.drawdown_quarter_size_multiplier,
+            "close_positions_on_kill_switch": False,
+            "close_positions_on_daily_loss": False,
+            "close_positions_on_drawdown": False,
+        }
+    )
+
     predictions_by_ts = {
         ts: grp.sort_values(["entry_score", prob_col, sym_col], ascending=[False, False, True]).reset_index(drop=True)
         for ts, grp in predictions.groupby(ts_col)
@@ -492,6 +548,15 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
             continue
 
         current_prices = {row[sym_col]: float(row[price_col]) for _, row in price_group.iterrows()}
+
+        risk_manager.set_timestamp(ts)
+        risk_manager.update_positions(open_positions, current_prices)
+        unrealized_before, open_notional_before, equity_before = compute_equity_state(
+            cash=cash,
+            open_positions=open_positions,
+            current_prices=current_prices,
+        )
+        risk_manager.update_equity(equity_before)
 
         # 1) manage open positions and exits first
         for symbol in list(open_positions.keys()):
@@ -525,11 +590,13 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                 )
                 trades.append(trade)
                 cash += partial_notional + trade.pnl_usd
+                risk_manager.update_realized_pnl(trade.pnl_usd, ts)
                 pos.quantity -= partial_quantity
                 pos.notional_usd -= partial_notional
                 pos.partial_exit_taken = True
                 diagnostics.partial_take_profit_events += 1
                 if pos.quantity <= 1e-12 or pos.notional_usd <= 1e-9:
+                    risk_manager.register_exit(symbol, ts, forced=False)
                     del open_positions[symbol]
                     continue
 
@@ -563,6 +630,28 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                 trade = finalize_trade(pos, ts, px, exit_reason, model_name)
                 cash += trade.pnl_usd + pos.notional_usd
                 trades.append(trade)
+                risk_manager.update_realized_pnl(trade.pnl_usd, ts)
+                risk_manager.register_exit(symbol, ts, forced=False)
+                del open_positions[symbol]
+
+        risk_manager.update_positions(open_positions, current_prices)
+        unrealized_mid, open_notional_mid, equity_mid = compute_equity_state(
+            cash=cash,
+            open_positions=open_positions,
+            current_prices=current_prices,
+        )
+        risk_manager.update_equity(equity_mid)
+
+        if risk_manager.should_force_exit() and open_positions:
+            for symbol in list(open_positions.keys()):
+                pos = open_positions[symbol]
+                px = current_prices.get(symbol, pos.entry_price)
+                model_name = _lookup_model_name(predictions_by_ts, pos.entry_timestamp, symbol, model_col, sym_col)
+                trade = finalize_trade(pos, ts, px, "risk_forced_exit", model_name)
+                cash += trade.pnl_usd + pos.notional_usd
+                trades.append(trade)
+                risk_manager.update_realized_pnl(trade.pnl_usd, ts)
+                risk_manager.register_exit(symbol, ts, forced=True)
                 del open_positions[symbol]
 
         # 2) entries from ranked candidates
@@ -620,11 +709,33 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                     prob_mult, vol_mult, kelly_fraction, kelly_mult, total_mult = compute_size_multipliers(row, args)
                     target_notional = float(args.notional_per_trade) * total_mult
 
+                    drawdown_size_multiplier = risk_manager.get_position_size_multiplier()
+                    if drawdown_size_multiplier <= 0.0:
+                        LOGGER.debug(
+                            "Risk manager blocked entry due to drawdown throttle: ts=%s symbol=%s",
+                            ts,
+                            symbol,
+                        )
+                        continue
+
+                    target_notional *= drawdown_size_multiplier
+
                     if target_notional < float(args.min_notional_per_trade):
                         diagnostics.sized_below_min_notional += 1
                         continue
                     if cash < target_notional:
                         diagnostics.skipped_cash += 1
+                        continue
+
+                    allowed, risk_reason = risk_manager.can_enter_trade(symbol, target_notional)
+                    if not allowed:
+                        LOGGER.debug(
+                            "Risk manager blocked entry: ts=%s symbol=%s notional=%.2f reason=%s",
+                            ts,
+                            symbol,
+                            target_notional,
+                            risk_reason,
+                        )
                         continue
 
                     entry_price = current_prices[symbol]
@@ -659,13 +770,22 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                     cash -= target_notional
                     submitted_count += 1
 
+                    risk_manager.update_positions(open_positions, current_prices)
+                    unrealized_after_entry, open_notional_after_entry, equity_after_entry = compute_equity_state(
+                        cash=cash,
+                        open_positions=open_positions,
+                        current_prices=current_prices,
+                    )
+                    risk_manager.update_equity(equity_after_entry)
+
         # 3) equity mark
-        unrealized = 0.0
-        open_notional = 0.0
-        for symbol, pos in open_positions.items():
-            px = current_prices.get(symbol, pos.entry_price)
-            unrealized += pos.quantity * (px - pos.entry_price)
-            open_notional += pos.notional_usd
+        risk_manager.update_positions(open_positions, current_prices)
+        unrealized, open_notional, equity = compute_equity_state(
+            cash=cash,
+            open_positions=open_positions,
+            current_prices=current_prices,
+        )
+        risk_manager.update_equity(equity)
 
         equity_rows.append(
             {
@@ -674,7 +794,12 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                 "open_positions": int(len(open_positions)),
                 "open_notional_usd": float(open_notional),
                 "unrealized_pnl_usd": float(unrealized),
-                "equity_usd": float(cash + open_notional + unrealized),
+                "equity_usd": float(equity),
+                "risk_safe_mode": int(risk_manager.safe_mode),
+                "risk_kill_switch": int(risk_manager.kill_switch_triggered),
+                "risk_total_exposure_usd": float(risk_manager.total_exposure),
+                "risk_daily_pnl_usd": float(risk_manager.current_daily_pnl()),
+                "risk_drawdown_pct": float(risk_manager.current_drawdown_pct()),
             }
         )
 
@@ -688,8 +813,11 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
     for symbol in list(open_positions.keys()):
         pos = open_positions[symbol]
         px = final_prices.get(symbol, pos.entry_price)
-        trades.append(finalize_trade(pos, final_ts, px, "forced_end", None))
+        trade = finalize_trade(pos, final_ts, px, "forced_end", None)
+        trades.append(trade)
         cash += pos.notional_usd + (pos.quantity * (px - pos.entry_price))
+        risk_manager.update_realized_pnl(trade.pnl_usd, final_ts)
+        risk_manager.register_exit(symbol, final_ts, forced=True)
         del open_positions[symbol]
 
     trade_columns = [
@@ -743,6 +871,12 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
     total_return = (ending_equity - args.initial_cash) / args.initial_cash if args.initial_cash else 0.0
     max_drawdown = compute_max_drawdown(equity_df["equity_usd"]) if not equity_df.empty else 0.0
 
+    risk_metrics = risk_manager.summary_metrics()
+    diagnostics.daily_loss_triggered = int(risk_metrics["daily_loss_triggered"])
+    diagnostics.exposure_violations = int(risk_metrics["exposure_violations"])
+    diagnostics.trades_blocked_by_risk = int(risk_metrics["trades_blocked_by_risk"])
+    diagnostics.forced_exits = int(risk_metrics["forced_exits"])
+
     summary_rows = [
             {"metric_name": "input_prediction_rows", "metric_value": int(len(predictions))},
             {"metric_name": "input_price_rows", "metric_value": int(len(prices))},
@@ -788,6 +922,19 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
             {"metric_name": "time_stop_hours", "metric_value": float(args.time_stop_hours) if args.time_stop_hours is not None else None},
             {"metric_name": "time_stop_min_return_pct", "metric_value": float(args.time_stop_min_return_pct)},
             {"metric_name": "max_hold_hours", "metric_value": float(args.max_hold_hours)},
+            {"metric_name": "enable_risk_manager", "metric_value": int(args.enable_risk_manager)},
+            {"metric_name": "max_daily_loss_usd", "metric_value": float(args.max_daily_loss_usd) if args.max_daily_loss_usd is not None else None},
+            {"metric_name": "max_total_exposure_usd", "metric_value": float(args.max_total_exposure_usd) if args.max_total_exposure_usd is not None else None},
+            {"metric_name": "max_total_exposure_pct", "metric_value": float(args.max_total_exposure_pct) if args.max_total_exposure_pct is not None else None},
+            {"metric_name": "max_exposure_per_symbol_usd", "metric_value": float(args.max_exposure_per_symbol_usd) if args.max_exposure_per_symbol_usd is not None else None},
+            {"metric_name": "max_drawdown_pct", "metric_value": float(args.max_drawdown_pct) if args.max_drawdown_pct is not None else None},
+            {"metric_name": "cooldown_minutes_per_symbol", "metric_value": float(args.cooldown_minutes_per_symbol)},
+            {"metric_name": "enable_drawdown_scaling", "metric_value": int(args.enable_drawdown_scaling)},
+            {"metric_name": "drawdown_full_size_pct", "metric_value": float(args.drawdown_full_size_pct)},
+            {"metric_name": "drawdown_half_size_pct", "metric_value": float(args.drawdown_half_size_pct)},
+            {"metric_name": "drawdown_quarter_size_pct", "metric_value": float(args.drawdown_quarter_size_pct)},
+            {"metric_name": "drawdown_half_size_multiplier", "metric_value": float(args.drawdown_half_size_multiplier)},
+            {"metric_name": "drawdown_quarter_size_multiplier", "metric_value": float(args.drawdown_quarter_size_multiplier)},
             {"metric_name": "timestamps_considered", "metric_value": diagnostics.timestamps_considered},
             {"metric_name": "candidate_rows_seen", "metric_value": diagnostics.candidate_rows_seen},
             {"metric_name": "candidate_rows_after_prob_threshold", "metric_value": diagnostics.candidate_rows_after_prob_threshold},
@@ -805,6 +952,22 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
             {"metric_name": "partial_take_profit_events", "metric_value": diagnostics.partial_take_profit_events},
             {"metric_name": "trailing_stop_exits", "metric_value": diagnostics.trailing_stop_exits},
             {"metric_name": "time_stop_exits", "metric_value": diagnostics.time_stop_exits},
+            {"metric_name": "daily_loss_triggered", "metric_value": diagnostics.daily_loss_triggered},
+            {"metric_name": "exposure_violations", "metric_value": diagnostics.exposure_violations},
+            {"metric_name": "trades_blocked_by_risk", "metric_value": diagnostics.trades_blocked_by_risk},
+            {"metric_name": "forced_exits", "metric_value": diagnostics.forced_exits},
+            {"metric_name": "kill_switch_activations", "metric_value": risk_metrics["kill_switch_activations"]},
+            {"metric_name": "drawdown_breach_events", "metric_value": risk_metrics["drawdown_breach_events"]},
+            {"metric_name": "cooldown_blocks", "metric_value": risk_metrics["cooldown_blocks"]},
+            {"metric_name": "daily_loss_blocks", "metric_value": risk_metrics["daily_loss_blocks"]},
+            {"metric_name": "risk_safe_mode_active", "metric_value": risk_metrics["safe_mode_active"]},
+            {"metric_name": "risk_kill_switch_active", "metric_value": risk_metrics["kill_switch_active"]},
+            {"metric_name": "ending_total_exposure_usd", "metric_value": risk_metrics["ending_total_exposure_usd"]},
+            {"metric_name": "ending_daily_pnl_usd", "metric_value": risk_metrics["ending_daily_pnl_usd"]},
+            {"metric_name": "ending_drawdown_pct", "metric_value": risk_metrics["ending_drawdown_pct"]},
+            {"metric_name": "drawdown_scaling_half_count", "metric_value": risk_metrics["drawdown_scaling_half_count"]},
+            {"metric_name": "drawdown_scaling_quarter_count", "metric_value": risk_metrics["drawdown_scaling_quarter_count"]},
+            {"metric_name": "drawdown_scaling_stop_count", "metric_value": risk_metrics["drawdown_scaling_stop_count"]},
             {"metric_name": "candidate_rate_after_prob_threshold", "metric_value": (diagnostics.candidate_rows_after_prob_threshold / diagnostics.candidate_rows_seen) if diagnostics.candidate_rows_seen else None},
             {"metric_name": "entry_open_rate", "metric_value": (diagnostics.entries_opened / diagnostics.entries_submitted) if diagnostics.entries_submitted else None},
             {"metric_name": "trade_rate_vs_candidates", "metric_value": (total_trades / diagnostics.candidate_rows_after_prob_threshold) if diagnostics.candidate_rows_after_prob_threshold else None},

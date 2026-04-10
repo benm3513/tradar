@@ -37,6 +37,12 @@ class SweepConfig:
     max_positions: int
     kelly_fraction_scale: float
     combined_size_cap: float
+    max_drawdown_pct: float
+    drawdown_full_size_pct: float
+    drawdown_half_size_pct: float
+    drawdown_quarter_size_pct: float
+    drawdown_half_size_multiplier: float
+    drawdown_quarter_size_multiplier: float
 
 
 @dataclass
@@ -50,12 +56,20 @@ class SweepRow:
     enable_dynamic_sizing: int
     enable_kelly_sizing: int
     enable_dynamic_max_positions: int
+    enable_risk_manager: int
+    enable_drawdown_scaling: int
     kelly_fraction_scale: float
     combined_size_cap: float
+    max_drawdown_pct: float
+    drawdown_full_size_pct: float
+    drawdown_half_size_pct: float
+    drawdown_quarter_size_pct: float
+    drawdown_half_size_multiplier: float
+    drawdown_quarter_size_multiplier: float
     ranking_mode: str | None
     total_pnl_usd: float | None
     total_return_pct: float | None
-    max_drawdown_pct: float | None
+    max_drawdown_pct_realized: float | None
     trades: int | None
     wins: int | None
     losses: int | None
@@ -69,6 +83,10 @@ class SweepRow:
     avg_kelly_fraction: float | None
     avg_kelly_multiplier: float | None
     avg_total_size_multiplier: float | None
+    trades_blocked_by_risk: float | None
+    drawdown_scaling_half_count: float | None
+    drawdown_scaling_quarter_count: float | None
+    drawdown_scaling_stop_count: float | None
     pnl_to_abs_drawdown: float | None
 
 
@@ -137,6 +155,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--time-stop-hours", type=float, default=None)
     parser.add_argument("--time-stop-min-return-pct", type=float, default=0.0)
 
+    parser.add_argument("--enable-risk-manager", action="store_true")
+    parser.add_argument("--max-daily-loss-usd", type=float, default=None)
+    parser.add_argument("--max-total-exposure-usd", type=float, default=None)
+    parser.add_argument("--max-total-exposure-pct", type=float, default=None)
+    parser.add_argument("--max-exposure-per-symbol-usd", type=float, default=None)
+    parser.add_argument("--cooldown-minutes-per-symbol", type=float, default=0.0)
+
+    parser.add_argument("--enable-drawdown-scaling", action="store_true")
+    parser.add_argument("--max-drawdown-pcts", nargs="+", type=float, default=[0.08])
+    parser.add_argument("--drawdown-full-size-pcts", nargs="+", type=float, default=[0.04])
+    parser.add_argument("--drawdown-half-size-pcts", nargs="+", type=float, default=[0.06])
+    parser.add_argument("--drawdown-quarter-size-pcts", nargs="+", type=float, default=[0.08])
+    parser.add_argument("--drawdown-half-size-multipliers", nargs="+", type=float, default=[0.50])
+    parser.add_argument("--drawdown-quarter-size-multipliers", nargs="+", type=float, default=[0.25])
+
     parser.add_argument("--results-table", default="ml_replay_sweep_results")
     parser.add_argument(
         "--summary-table-prefix",
@@ -175,8 +208,21 @@ def build_grid(args: argparse.Namespace) -> list[SweepConfig]:
         args.max_positions_values,
         args.kelly_fraction_scales,
         args.combined_size_caps,
+        args.max_drawdown_pcts,
+        args.drawdown_full_size_pcts,
+        args.drawdown_half_size_pcts,
+        args.drawdown_quarter_size_pcts,
+        args.drawdown_half_size_multipliers,
+        args.drawdown_quarter_size_multipliers,
     ):
-        configs.append(SweepConfig(*values))
+        cfg = SweepConfig(*values)
+        if not (
+            cfg.drawdown_full_size_pct <= cfg.drawdown_half_size_pct
+            <= cfg.drawdown_quarter_size_pct
+            <= cfg.max_drawdown_pct
+        ):
+            continue
+        configs.append(cfg)
     return configs
 
 
@@ -287,12 +333,25 @@ def make_replay_args(args: argparse.Namespace, cfg: SweepConfig, run_id: int) ->
         take_profit_pct=cfg.take_profit_pct,
         stop_loss_pct=cfg.stop_loss_pct,
         max_hold_hours=args.max_hold_hours,
-        trailing_stop_pct=args.trailing_stop_pct,
-        trailing_stop_activation_pct=args.trailing_stop_activation_pct,
-        partial_take_profit_pct=args.partial_take_profit_pct,
+        trailing_stop_pct=(0.05 if args.trailing_stop_pct is None else args.trailing_stop_pct),
+        trailing_stop_activation_pct=(0.08 if args.trailing_stop_activation_pct is None else args.trailing_stop_activation_pct),
+        partial_take_profit_pct=(0.10 if args.partial_take_profit_pct is None else args.partial_take_profit_pct),
         partial_take_profit_fraction=args.partial_take_profit_fraction,
         time_stop_hours=args.time_stop_hours,
         time_stop_min_return_pct=args.time_stop_min_return_pct,
+        enable_risk_manager=args.enable_risk_manager,
+        max_daily_loss_usd=args.max_daily_loss_usd,
+        max_total_exposure_usd=args.max_total_exposure_usd,
+        max_total_exposure_pct=args.max_total_exposure_pct,
+        max_exposure_per_symbol_usd=args.max_exposure_per_symbol_usd,
+        max_drawdown_pct=cfg.max_drawdown_pct,
+        cooldown_minutes_per_symbol=args.cooldown_minutes_per_symbol,
+        enable_drawdown_scaling=args.enable_drawdown_scaling,
+        drawdown_full_size_pct=cfg.drawdown_full_size_pct,
+        drawdown_half_size_pct=cfg.drawdown_half_size_pct,
+        drawdown_quarter_size_pct=cfg.drawdown_quarter_size_pct,
+        drawdown_half_size_multiplier=cfg.drawdown_half_size_multiplier,
+        drawdown_quarter_size_multiplier=cfg.drawdown_quarter_size_multiplier,
         trades_table=per_run_table_name(args.trades_table_prefix, run_id),
         equity_table=per_run_table_name(args.equity_table_prefix, run_id),
         summary_table=per_run_table_name(args.summary_table_prefix, run_id),
@@ -331,7 +390,9 @@ def run_one(
     replay_args = make_replay_args(args, cfg, run_id)
 
     LOGGER.info(
-        "Sweep run %d: prob=%.4f tp=%.4f sl=%.4f top_n=%d max_pos=%d kelly=%.4f size_cap=%.4f",
+        "Sweep run %d: prob=%.4f tp=%.4f sl=%.4f top_n=%d max_pos=%d "
+        "kelly=%.4f size_cap=%.4f max_dd=%.4f dd_full=%.4f dd_half=%.4f dd_qtr=%.4f "
+        "half_mult=%.2f qtr_mult=%.2f",
         run_id,
         cfg.prob_threshold,
         cfg.take_profit_pct,
@@ -340,6 +401,12 @@ def run_one(
         cfg.max_positions,
         cfg.kelly_fraction_scale,
         cfg.combined_size_cap,
+        cfg.max_drawdown_pct,
+        cfg.drawdown_full_size_pct,
+        cfg.drawdown_half_size_pct,
+        cfg.drawdown_quarter_size_pct,
+        cfg.drawdown_half_size_multiplier,
+        cfg.drawdown_quarter_size_multiplier,
     )
 
     predictions_df = replay_mod.load_predictions(conn, replay_args)
@@ -372,12 +439,20 @@ def run_one(
         enable_dynamic_sizing=int(bool(args.enable_dynamic_sizing)),
         enable_kelly_sizing=int(bool(args.enable_kelly_sizing)),
         enable_dynamic_max_positions=int(bool(args.enable_dynamic_max_positions)),
+        enable_risk_manager=int(bool(args.enable_risk_manager)),
+        enable_drawdown_scaling=int(bool(args.enable_drawdown_scaling)),
         kelly_fraction_scale=cfg.kelly_fraction_scale,
         combined_size_cap=cfg.combined_size_cap,
+        max_drawdown_pct=cfg.max_drawdown_pct,
+        drawdown_full_size_pct=cfg.drawdown_full_size_pct,
+        drawdown_half_size_pct=cfg.drawdown_half_size_pct,
+        drawdown_quarter_size_pct=cfg.drawdown_quarter_size_pct,
+        drawdown_half_size_multiplier=cfg.drawdown_half_size_multiplier,
+        drawdown_quarter_size_multiplier=cfg.drawdown_quarter_size_multiplier,
         ranking_mode=safe_text(metrics, "ranking_mode") or args.ranking_mode,
         total_pnl_usd=total_pnl_metric,
         total_return_pct=safe_metric(metrics, "total_return_pct"),
-        max_drawdown_pct=max_drawdown_metric,
+        max_drawdown_pct_realized=max_drawdown_metric,
         trades=int(trades_metric) if trades_metric is not None else None,
         wins=int(wins_metric) if wins_metric is not None else None,
         losses=int(losses_metric) if losses_metric is not None else None,
@@ -391,6 +466,10 @@ def run_one(
         avg_kelly_fraction=safe_metric(metrics, "avg_kelly_fraction"),
         avg_kelly_multiplier=safe_metric(metrics, "avg_kelly_multiplier"),
         avg_total_size_multiplier=safe_metric(metrics, "avg_total_size_multiplier"),
+        trades_blocked_by_risk=safe_metric(metrics, "trades_blocked_by_risk"),
+        drawdown_scaling_half_count=safe_metric(metrics, "drawdown_scaling_half_count"),
+        drawdown_scaling_quarter_count=safe_metric(metrics, "drawdown_scaling_quarter_count"),
+        drawdown_scaling_stop_count=safe_metric(metrics, "drawdown_scaling_stop_count"),
         pnl_to_abs_drawdown=derive_pnl_to_drawdown(total_pnl_metric, max_drawdown_metric),
     )
     return row
@@ -425,6 +504,7 @@ def main() -> int:
         raise ValueError("No sweep configurations were generated")
 
     LOGGER.info("Opening SQLite database: %s", args.db_path)
+    LOGGER.info("Generated %d sweep configurations", len(configs))
     conn = sqlite3.connect(args.db_path)
     try:
         rows = [run_one(args, conn, idx, cfg) for idx, cfg in enumerate(configs, start=1)]
@@ -443,10 +523,19 @@ def main() -> int:
             "max_positions",
             "kelly_fraction_scale",
             "combined_size_cap",
-            "total_pnl_usd",
             "max_drawdown_pct",
+            "drawdown_full_size_pct",
+            "drawdown_half_size_pct",
+            "drawdown_quarter_size_pct",
+            "drawdown_half_size_multiplier",
+            "drawdown_quarter_size_multiplier",
+            "total_pnl_usd",
+            "max_drawdown_pct_realized",
             "win_rate",
             "trades",
+            "drawdown_scaling_half_count",
+            "drawdown_scaling_quarter_count",
+            "drawdown_scaling_stop_count",
             "pnl_to_abs_drawdown",
         ]
         existing_top_cols = [col for col in top_cols if col in results_df.columns]
