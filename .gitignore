@@ -49,3 +49,6 @@ config/local.yaml
 config/*.local.yaml
 data/
 backtests/
+*.db-wal
+*.db-shm
+*.db

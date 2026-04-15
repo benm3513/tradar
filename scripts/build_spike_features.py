@@ -1,16 +1,22 @@
+#!/usr/bin/env python3
 """Build time-aware market features for Phase 4 spike-regime research.
 
-This script computes *backward-looking* market features from the base research
+This script computes backward-looking market features from the base research
 rows and optionally merges them with the labeled dataset to produce a single
 feature table suitable for downstream inspection and training export.
 
-Design goals
-------------
-- No trading-engine changes
-- Strictly no future leakage
-- Per-symbol computation only
-- Time-aware windows instead of row-count assumptions
-- SQLite -> pandas -> SQLite flow
+Phase 4.7 upgrades
+------------------
+- Preserves strict no-leakage, backward-looking feature computation
+- Merges cleanly with upgraded multi-horizon label outputs
+- Supports stable alias labels:
+    - spike_6h_label
+    - spike_24h_label
+    - spike_72h_label
+    - tradeable_pre_spike_6h_label
+    - ...
+- Adds multi-horizon join diagnostics
+- Produces summary metrics for label coverage by horizon
 
 Typical usage
 -------------
@@ -44,6 +50,7 @@ DEFAULT_TIME_COLUMN = "timestamp"
 DEFAULT_PRICE_COLUMN = "price_close"
 DEFAULT_OUTPUT_TABLE = "spike_feature_rows"
 DEFAULT_SUMMARY_TABLE = "spike_feature_summary"
+SUPPORTED_HORIZONS = ("6h", "24h", "72h", "7d")
 
 FEATURE_COLUMNS = [
     "ret_1h",
@@ -65,6 +72,28 @@ QUALITY_FLAG_COLUMNS = [
     "is_sparse_stream",
     "is_tail_unlabelable",
     "has_label_row",
+]
+
+MULTI_HORIZON_LABEL_COLUMNS = [
+    "spike_6h_label",
+    "spike_24h_label",
+    "spike_72h_label",
+    "spike_7d_label",
+    "tradeable_pre_spike_6h_label",
+    "tradeable_pre_spike_24h_label",
+    "tradeable_pre_spike_72h_label",
+    "tradeable_pre_spike_7d_label",
+]
+
+LEGACY_LABEL_COLUMNS = [
+    "label_spike_6h",
+    "label_spike_24h",
+    "label_spike_72h",
+    "label_spike_7d",
+    "label_tradeable_pre_spike_6h",
+    "label_tradeable_pre_spike_24h",
+    "label_tradeable_pre_spike_72h",
+    "label_tradeable_pre_spike_7d",
 ]
 
 
@@ -259,8 +288,6 @@ def build_features_for_asset(
 ) -> pd.DataFrame:
     asset_frame = asset_frame.sort_values(timestamp_column).reset_index(drop=True).copy()
 
-    # Time-aware lagged returns. These are based on the latest available price at
-    # or before t-horizon, which makes them robust to sparse/irregular histories.
     asset_frame["ret_1h"] = _compute_time_aware_returns(
         asset_frame,
         timestamp_column=timestamp_column,
@@ -284,7 +311,6 @@ def build_features_for_asset(
     one_step_return = indexed[price_column].astype(float).pct_change()
     trailing_window = "24h"
 
-    # Rolling volatility of 1-step returns over the trailing 24h window.
     asset_frame["rolling_volatility_24h"] = (
         one_step_return.rolling(trailing_window, min_periods=2).std().to_numpy()
     )
@@ -297,8 +323,6 @@ def build_features_for_asset(
         _safe_divide(trailing_high - trailing_low, current_close).to_numpy()
     )
 
-    # Volume ratios remain useful even when current data is sparse; zero-denominator
-    # cases are surfaced as NaN rather than forcing misleading values.
     current_volume = indexed["volume_base"].astype(float)
     trailing_vol_1h = current_volume.rolling("1h", min_periods=1).sum()
     trailing_vol_24h = current_volume.rolling(trailing_window, min_periods=1).sum()
@@ -380,6 +404,28 @@ def build_feature_frame(
     return pd.concat(groups, ignore_index=True)
 
 
+def _preferred_tail_label_column(columns: Sequence[str]) -> str | None:
+    for candidate in ("spike_6h_label", "label_spike_6h", "spike_24h_label", "label_spike_24h"):
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def _present_label_columns(columns: Sequence[str]) -> list[str]:
+    return [
+        col for col in (
+            MULTI_HORIZON_LABEL_COLUMNS
+            + LEGACY_LABEL_COLUMNS
+            + [f"has_full_horizon_{h}" for h in SUPPORTED_HORIZONS]
+            + [f"threshold_spike_return_{h}" for h in SUPPORTED_HORIZONS]
+            + [f"threshold_tradeable_return_{h}" for h in SUPPORTED_HORIZONS]
+            + [f"applied_spike_threshold_{h}" for h in SUPPORTED_HORIZONS]
+            + [f"applied_tradeable_min_return_{h}" for h in SUPPORTED_HORIZONS]
+        )
+        if col in columns
+    ]
+
+
 def merge_with_labels(
     feature_frame: pd.DataFrame,
     label_frame: pd.DataFrame,
@@ -391,6 +437,9 @@ def merge_with_labels(
         out = feature_frame.copy()
         out["has_label_row"] = 0
         out["is_tail_unlabelable"] = np.nan
+        for horizon in SUPPORTED_HORIZONS:
+            out[f"has_spike_label_{horizon}"] = 0
+            out[f"has_tradeable_label_{horizon}"] = 0
         return out
 
     join_columns = [*asset_key_columns, timestamp_column]
@@ -407,19 +456,39 @@ def merge_with_labels(
             f"label table contains duplicate asset/timestamp rows: {duplicate_count}"
         )
 
-    drop_from_labels = [
-        col for col in feature_frame.columns if col in label_frame.columns and col not in join_columns
-    ]
-    label_payload = label_frame.drop(columns=drop_from_labels, errors="ignore")
+    label_columns_to_keep = _present_label_columns(label_frame.columns)
+    label_payload = label_frame[[*join_columns, *label_columns_to_keep]].copy()
 
     merged = feature_frame.merge(label_payload, on=join_columns, how="left", validate="one_to_one")
-    label_columns = [col for col in merged.columns if col.startswith("label_")]
+
+    label_columns = [
+        col for col in merged.columns
+        if col.endswith("_label") or col.startswith("label_")
+    ]
     merged["has_label_row"] = merged[label_columns].notna().any(axis=1).astype(int) if label_columns else 0
 
-    if "label_spike_6h" in merged.columns:
-        merged["is_tail_unlabelable"] = merged["label_spike_6h"].isna().astype(int)
+    tail_label_col = _preferred_tail_label_column(merged.columns)
+    if tail_label_col is not None:
+        merged["is_tail_unlabelable"] = merged[tail_label_col].isna().astype(int)
     else:
         merged["is_tail_unlabelable"] = np.nan
+
+    for horizon in SUPPORTED_HORIZONS:
+        spike_candidates = [f"spike_{horizon}_label", f"label_spike_{horizon}"]
+        tradeable_candidates = [
+            f"tradeable_pre_spike_{horizon}_label",
+            f"label_tradeable_pre_spike_{horizon}",
+        ]
+
+        spike_col = next((c for c in spike_candidates if c in merged.columns), None)
+        tradeable_col = next((c for c in tradeable_candidates if c in merged.columns), None)
+
+        merged[f"has_spike_label_{horizon}"] = (
+            merged[spike_col].notna().astype(int) if spike_col is not None else 0
+        )
+        merged[f"has_tradeable_label_{horizon}"] = (
+            merged[tradeable_col].notna().astype(int) if tradeable_col is not None else 0
+        )
 
     return merged
 
@@ -443,7 +512,7 @@ def _build_value_summary_row(feature_frame: pd.DataFrame, column: str) -> dict[s
 
 
 def _build_binary_summary_row(feature_frame: pd.DataFrame, metric_type: str, column: str) -> dict[str, object]:
-    series = feature_frame[column]
+    series = pd.to_numeric(feature_frame[column], errors="coerce")
     non_null = series.dropna()
     return {
         "metric_type": metric_type,
@@ -468,10 +537,16 @@ def build_summary_frame(feature_frame: pd.DataFrame) -> pd.DataFrame:
             continue
         summary_rows.append(_build_value_summary_row(feature_frame, column))
 
-    for column in QUALITY_FLAG_COLUMNS:
+    quality_columns = QUALITY_FLAG_COLUMNS + [
+        f"has_spike_label_{h}" for h in SUPPORTED_HORIZONS
+    ] + [
+        f"has_tradeable_label_{h}" for h in SUPPORTED_HORIZONS
+    ]
+
+    for column in quality_columns:
         if column not in feature_frame.columns:
             continue
-        metric_type = "join" if column == "has_label_row" else "quality"
+        metric_type = "join" if column in {"has_label_row", *[f"has_spike_label_{h}" for h in SUPPORTED_HORIZONS], *[f"has_tradeable_label_{h}" for h in SUPPORTED_HORIZONS]} else "quality"
         summary_rows.append(_build_binary_summary_row(feature_frame, metric_type, column))
 
     alias_rows: list[tuple[str, str]] = [
@@ -488,7 +563,7 @@ def build_summary_frame(feature_frame: pd.DataFrame) -> pd.DataFrame:
         source_col = alias_to_source[alias_name]
         if source_col not in feature_frame.columns:
             continue
-        series = feature_frame[source_col].dropna()
+        series = pd.to_numeric(feature_frame[source_col], errors="coerce").dropna()
         summary_rows.append(
             {
                 "metric_type": metric_type,
@@ -498,15 +573,15 @@ def build_summary_frame(feature_frame: pd.DataFrame) -> pd.DataFrame:
                 "positive_rate": float(series.mean()) if not series.empty else None,
                 "mean_value": None,
                 "median_value": None,
-                "missing_rows": int(feature_frame[source_col].isna().sum()),
-                "missing_rate": float(feature_frame[source_col].isna().mean()) if len(feature_frame) else None,
+                "missing_rows": int(pd.to_numeric(feature_frame[source_col], errors="coerce").isna().sum()),
+                "missing_rate": float(pd.to_numeric(feature_frame[source_col], errors="coerce").isna().mean()) if len(feature_frame) else None,
                 "min_value": None,
                 "max_value": None,
             }
         )
 
     if "hours_since_prev_row" in feature_frame.columns:
-        series = feature_frame["hours_since_prev_row"].dropna()
+        series = pd.to_numeric(feature_frame["hours_since_prev_row"], errors="coerce").dropna()
         summary_rows.append(
             {
                 "metric_type": "quality",
@@ -516,8 +591,8 @@ def build_summary_frame(feature_frame: pd.DataFrame) -> pd.DataFrame:
                 "positive_rate": None,
                 "mean_value": float(series.mean()) if not series.empty else None,
                 "median_value": None,
-                "missing_rows": int(feature_frame["hours_since_prev_row"].isna().sum()),
-                "missing_rate": float(feature_frame["hours_since_prev_row"].isna().mean()) if len(feature_frame) else None,
+                "missing_rows": int(pd.to_numeric(feature_frame["hours_since_prev_row"], errors="coerce").isna().sum()),
+                "missing_rate": float(pd.to_numeric(feature_frame["hours_since_prev_row"], errors="coerce").isna().mean()) if len(feature_frame) else None,
                 "min_value": None,
                 "max_value": None,
             }
@@ -531,8 +606,8 @@ def build_summary_frame(feature_frame: pd.DataFrame) -> pd.DataFrame:
                 "positive_rate": None,
                 "mean_value": None,
                 "median_value": float(series.median()) if not series.empty else None,
-                "missing_rows": int(feature_frame["hours_since_prev_row"].isna().sum()),
-                "missing_rate": float(feature_frame["hours_since_prev_row"].isna().mean()) if len(feature_frame) else None,
+                "missing_rows": int(pd.to_numeric(feature_frame["hours_since_prev_row"], errors="coerce").isna().sum()),
+                "missing_rate": float(pd.to_numeric(feature_frame["hours_since_prev_row"], errors="coerce").isna().mean()) if len(feature_frame) else None,
                 "min_value": None,
                 "max_value": None,
             }
@@ -607,6 +682,9 @@ def main() -> int:
         else:
             feature_frame["has_label_row"] = 0
             feature_frame["is_tail_unlabelable"] = np.nan
+            for horizon in SUPPORTED_HORIZONS:
+                feature_frame[f"has_spike_label_{horizon}"] = 0
+                feature_frame[f"has_tradeable_label_{horizon}"] = 0
 
         LOGGER.info("Writing feature rows to table: %s", args.output_table)
         write_frame_to_sqlite(

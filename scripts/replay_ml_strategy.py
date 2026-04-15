@@ -2,9 +2,25 @@
 
 Research-only replay script for Phase 4/5 Tradar development.
 
+Phase 4.7 upgrades
+------------------
+- Supports multi-horizon prediction sources:
+    - ensemble
+    - 6h
+    - 24h
+    - 72h
+    - direct (legacy/manual table mode)
+- Uses ensemble_score for ranking when prediction_source=ensemble
+- Preserves backward compatibility with single-model prediction tables
+- Allows explicit score-column override for experiments
+
 Inputs
 ------
-1. predictions table: symbol, timestamp, pred_prob[, model_name]
+1. predictions table:
+   direct/horizon tables:
+       symbol, timestamp, pred_prob[, model_name]
+   ensemble tables:
+       symbol, timestamp, ensemble_score[, prob_ensemble, prob_6h, prob_24h, prob_72h]
 2. price table: symbol, timestamp, price_close
 3. optional context table: symbol, timestamp, rolling_volatility_24h,
    target_time_to_peak_seconds_24h
@@ -14,20 +30,6 @@ At each timestamp, the replay:
 - ranks current candidates cross-sectionally
 - applies optional candidate filters
 - opens top-ranked long positions subject to position/cash limits
-
-Dynamic sizing
---------------
-When enabled, target notional is scaled by:
-- convex probability multiplier
-- soft volatility multiplier
-- optional Kelly overlay multiplier
-
-Exit intelligence
------------------
-Optional upgrades include:
-- trailing stop after a profit activation threshold
-- partial take profit before full exit
-- underperformance time-stop before the hard max-hold limit
 """
 
 from __future__ import annotations
@@ -126,6 +128,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--price-table", default="spike_base_rows")
     parser.add_argument("--context-table", default="spike_training_rows")
 
+    parser.add_argument(
+        "--prediction-source",
+        choices=["ensemble", "6h", "24h", "72h", "direct"],
+        default="direct",
+        help=(
+            "Prediction source mode. "
+            "'ensemble' expects ensemble_score/prob_ensemble style tables. "
+            "'6h'/'24h'/'72h' are horizon-specific modes. "
+            "'direct' preserves legacy behavior."
+        ),
+    )
+    parser.add_argument(
+        "--score-column",
+        default=None,
+        help=(
+            "Optional override for ranking score column. "
+            "Defaults to ensemble_score for ensemble mode and pred_prob otherwise."
+        ),
+    )
+
     parser.add_argument("--symbol-column", default="symbol")
     parser.add_argument("--timestamp-column", default="timestamp")
     parser.add_argument("--price-column", default="price_close")
@@ -207,25 +229,70 @@ def configure_logging(level: str) -> None:
     )
 
 
+def resolve_prediction_columns(df: pd.DataFrame, args: argparse.Namespace) -> tuple[str, str]:
+    """
+    Returns:
+        prob_col: column used for probability gating/sizing
+        score_col: column used for ranking
+    """
+    source = args.prediction_source
+    explicit_score = args.score_column
+
+    if source == "ensemble":
+        prob_candidates = ["prob_ensemble", "ensemble_score", args.prob_column]
+        score_candidates = [explicit_score] if explicit_score else ["ensemble_score", "prob_ensemble", args.prob_column]
+    elif source in {"6h", "24h", "72h"}:
+        horizon_prob = f"prob_{source}"
+        prob_candidates = [horizon_prob, args.prob_column]
+        score_candidates = [explicit_score] if explicit_score else [horizon_prob, args.prob_column]
+    else:
+        prob_candidates = [args.prob_column]
+        score_candidates = [explicit_score] if explicit_score else [args.prob_column]
+
+    prob_col = next((c for c in prob_candidates if c and c in df.columns), None)
+    score_col = next((c for c in score_candidates if c and c in df.columns), None)
+
+    if prob_col is None:
+        raise KeyError(
+            f"Could not resolve probability column for prediction_source={source}. "
+            f"Tried: {prob_candidates}"
+        )
+    if score_col is None:
+        raise KeyError(
+            f"Could not resolve score column for prediction_source={source}. "
+            f"Tried: {score_candidates}"
+        )
+    return prob_col, score_col
+
+
 def load_predictions(conn: sqlite3.Connection, args: argparse.Namespace) -> pd.DataFrame:
-    query = f"SELECT * FROM {args.predictions_table}"
+    query = f'SELECT * FROM "{args.predictions_table}"'
     df = pd.read_sql_query(query, conn)
 
-    required = [args.symbol_column, args.timestamp_column, args.prob_column]
+    required = [args.symbol_column, args.timestamp_column]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise KeyError(f"Prediction table missing required columns: {missing}")
 
+    prob_col, score_col = resolve_prediction_columns(df, args)
+
     df = df.copy()
     df[args.timestamp_column] = pd.to_datetime(df[args.timestamp_column], utc=True, errors="raise")
-    df[args.prob_column] = pd.to_numeric(df[args.prob_column], errors="coerce")
-    df = df.dropna(subset=[args.symbol_column, args.timestamp_column, args.prob_column])
-    sort_cols = [args.timestamp_column, args.prob_column, args.symbol_column]
+    df[prob_col] = pd.to_numeric(df[prob_col], errors="coerce")
+    df[score_col] = pd.to_numeric(df[score_col], errors="coerce")
+    df = df.dropna(subset=[args.symbol_column, args.timestamp_column, prob_col, score_col])
+
+    if prob_col != args.prob_column:
+        df[args.prob_column] = df[prob_col]
+    df["_resolved_prob_col"] = prob_col
+    df["_resolved_score_col"] = score_col
+
+    sort_cols = [args.timestamp_column, score_col, args.symbol_column]
     return df.sort_values(sort_cols, ascending=[True, False, True]).reset_index(drop=True)
 
 
 def load_prices(conn: sqlite3.Connection, args: argparse.Namespace) -> pd.DataFrame:
-    query = f"SELECT * FROM {args.price_table}"
+    query = f'SELECT * FROM "{args.price_table}"'
     df = pd.read_sql_query(query, conn)
 
     required = [args.symbol_column, args.timestamp_column]
@@ -253,7 +320,7 @@ def load_prices(conn: sqlite3.Connection, args: argparse.Namespace) -> pd.DataFr
 
 
 def load_context(conn: sqlite3.Connection, args: argparse.Namespace) -> pd.DataFrame:
-    query = f"SELECT * FROM {args.context_table}"
+    query = f'SELECT * FROM "{args.context_table}"'
     df = pd.read_sql_query(query, conn)
 
     required = [args.symbol_column, args.timestamp_column]
@@ -295,8 +362,15 @@ def _safe_group_zscore(series: pd.Series) -> pd.Series:
 def enrich_predictions(predictions: pd.DataFrame, context: pd.DataFrame, args: argparse.Namespace) -> pd.DataFrame:
     ts_col = args.timestamp_column
     sym_col = args.symbol_column
-    prob_col = args.prob_column
+    prob_col = "_resolved_prob_col"
+    score_col = "_resolved_score_col"
     vol_col = args.rolling_volatility_column
+
+    if prob_col not in predictions.columns or score_col not in predictions.columns:
+        raise KeyError("Predictions frame is missing resolved probability/score metadata columns")
+
+    actual_prob_col = str(predictions[prob_col].iloc[0])
+    actual_score_col = str(predictions[score_col].iloc[0])
 
     merged = predictions.merge(
         context,
@@ -305,9 +379,10 @@ def enrich_predictions(predictions: pd.DataFrame, context: pd.DataFrame, args: a
         validate="many_to_one",
     )
 
-    merged["prob_percentile_rank"] = merged.groupby(ts_col)[prob_col].rank(method="min", pct=True, ascending=True)
-    merged["prob_rank_desc"] = merged.groupby(ts_col)[prob_col].rank(method="first", ascending=False)
-    merged["prob_zscore"] = merged.groupby(ts_col)[prob_col].transform(_safe_group_zscore)
+    merged["prob_percentile_rank"] = merged.groupby(ts_col)[actual_prob_col].rank(method="min", pct=True, ascending=True)
+    merged["prob_rank_desc"] = merged.groupby(ts_col)[actual_prob_col].rank(method="first", ascending=False)
+    merged["prob_zscore"] = merged.groupby(ts_col)[actual_prob_col].transform(_safe_group_zscore)
+    merged["score_zscore"] = merged.groupby(ts_col)[actual_score_col].transform(_safe_group_zscore)
 
     if vol_col in merged.columns:
         merged[vol_col] = pd.to_numeric(merged[vol_col], errors="coerce")
@@ -322,16 +397,22 @@ def enrich_predictions(predictions: pd.DataFrame, context: pd.DataFrame, args: a
     merged["time_to_peak_zscore"] = merged.groupby(ts_col)["predicted_time_to_peak_hours"].transform(_safe_group_zscore)
 
     if args.ranking_mode == "probability":
-        merged["entry_score"] = merged[prob_col].astype(float)
+        merged["entry_score"] = merged[actual_score_col].astype(float)
     else:
         merged["entry_score"] = (
-            float(args.prob_zscore_weight) * merged["prob_zscore"].fillna(0.0)
+            float(args.prob_zscore_weight) * merged["score_zscore"].fillna(0.0)
             + float(args.percentile_weight) * (merged["prob_percentile_rank"].fillna(0.5) - 0.5)
             + float(args.volatility_weight) * merged["volatility_zscore"].fillna(0.0)
             - float(args.time_to_peak_weight) * merged["time_to_peak_zscore"].fillna(0.0)
         )
 
-    return merged.sort_values([ts_col, "entry_score", prob_col, sym_col], ascending=[True, False, False, True]).reset_index(drop=True)
+    merged["_resolved_prob_col_name"] = actual_prob_col
+    merged["_resolved_score_col_name"] = actual_score_col
+
+    return merged.sort_values(
+        [ts_col, "entry_score", actual_score_col, sym_col],
+        ascending=[True, False, False, True],
+    ).reset_index(drop=True)
 
 
 def compute_max_drawdown(equity: pd.Series) -> float:
@@ -359,7 +440,6 @@ def compute_equity_state(
 
 
 def compute_kelly_terms(pred_prob: float, args: argparse.Namespace) -> Tuple[float, float]:
-    """Return (kelly_fraction, kelly_multiplier)."""
     if not args.enable_kelly_sizing:
         return 0.0, 1.0
 
@@ -381,7 +461,6 @@ def compute_kelly_terms(pred_prob: float, args: argparse.Namespace) -> Tuple[flo
 
 
 def compute_size_multipliers(row: pd.Series, args: argparse.Namespace) -> tuple[float, float, float, float, float]:
-    """Return (prob_multiplier, vol_multiplier, kelly_fraction, kelly_multiplier, total_multiplier)."""
     if not args.enable_dynamic_sizing:
         kf, km = compute_kelly_terms(float(row[args.prob_column]), args)
         return 1.0, 1.0, kf, km, km
@@ -412,7 +491,13 @@ def compute_size_multipliers(row: pd.Series, args: argparse.Namespace) -> tuple[
     )
 
 
-def _lookup_model_name(predictions_by_ts: Dict[pd.Timestamp, pd.DataFrame], ts: pd.Timestamp, symbol: str, model_col: str, sym_col: str) -> Optional[str]:
+def _lookup_model_name(
+    predictions_by_ts: Dict[pd.Timestamp, pd.DataFrame],
+    ts: pd.Timestamp,
+    symbol: str,
+    model_col: str,
+    sym_col: str,
+) -> Optional[str]:
     pred_rows = predictions_by_ts.get(ts)
     if pred_rows is None or model_col not in pred_rows.columns:
         return None
@@ -502,6 +587,12 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
     vol_col = args.rolling_volatility_column
     model_col = args.model_name_column
 
+    resolved_score_col = (
+        predictions["_resolved_score_col_name"].iloc[0]
+        if "_resolved_score_col_name" in predictions.columns and not predictions.empty
+        else prob_col
+    )
+
     timestamps = sorted(set(predictions[ts_col]).intersection(set(prices[ts_col])))
     if not timestamps:
         raise ValueError("No overlapping timestamps between predictions and prices")
@@ -537,7 +628,7 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
     )
 
     predictions_by_ts = {
-        ts: grp.sort_values(["entry_score", prob_col, sym_col], ascending=[False, False, True]).reset_index(drop=True)
+        ts: grp.sort_values(["entry_score", resolved_score_col, sym_col], ascending=[False, False, True]).reset_index(drop=True)
         for ts, grp in predictions.groupby(ts_col)
     }
     prices_by_ts = {ts: grp.reset_index(drop=True) for ts, grp in prices.groupby(ts_col)}
@@ -551,14 +642,9 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
 
         risk_manager.set_timestamp(ts)
         risk_manager.update_positions(open_positions, current_prices)
-        unrealized_before, open_notional_before, equity_before = compute_equity_state(
-            cash=cash,
-            open_positions=open_positions,
-            current_prices=current_prices,
-        )
+        _, _, equity_before = compute_equity_state(cash=cash, open_positions=open_positions, current_prices=current_prices)
         risk_manager.update_equity(equity_before)
 
-        # 1) manage open positions and exits first
         for symbol in list(open_positions.keys()):
             pos = open_positions[symbol]
             if symbol not in current_prices:
@@ -635,11 +721,7 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                 del open_positions[symbol]
 
         risk_manager.update_positions(open_positions, current_prices)
-        unrealized_mid, open_notional_mid, equity_mid = compute_equity_state(
-            cash=cash,
-            open_positions=open_positions,
-            current_prices=current_prices,
-        )
+        _, _, equity_mid = compute_equity_state(cash=cash, open_positions=open_positions, current_prices=current_prices)
         risk_manager.update_equity(equity_mid)
 
         if risk_manager.should_force_exit() and open_positions:
@@ -654,7 +736,6 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                 risk_manager.register_exit(symbol, ts, forced=True)
                 del open_positions[symbol]
 
-        # 2) entries from ranked candidates
         candidates = predictions_by_ts.get(ts)
         if candidates is not None and not candidates.empty:
             diagnostics.candidate_rows_seen += int(len(candidates))
@@ -684,7 +765,10 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
             diagnostics.candidate_rows_after_rank_score += int(len(candidates))
 
             if not candidates.empty:
-                candidates = candidates.sort_values(["entry_score", prob_col, sym_col], ascending=[False, False, True]).head(max(int(args.top_n), 0))
+                candidates = candidates.sort_values(
+                    ["entry_score", resolved_score_col, sym_col],
+                    ascending=[False, False, True],
+                ).head(max(int(args.top_n), 0))
             diagnostics.entries_submitted += int(len(candidates))
 
             allowed_position_total = _compute_dynamic_position_limit(candidates, args)
@@ -771,14 +855,13 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                     submitted_count += 1
 
                     risk_manager.update_positions(open_positions, current_prices)
-                    unrealized_after_entry, open_notional_after_entry, equity_after_entry = compute_equity_state(
+                    _, _, equity_after_entry = compute_equity_state(
                         cash=cash,
                         open_positions=open_positions,
                         current_prices=current_prices,
                     )
                     risk_manager.update_equity(equity_after_entry)
 
-        # 3) equity mark
         risk_manager.update_positions(open_positions, current_prices)
         unrealized, open_notional, equity = compute_equity_state(
             cash=cash,
@@ -878,122 +961,128 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
     diagnostics.forced_exits = int(risk_metrics["forced_exits"])
 
     summary_rows = [
-            {"metric_name": "input_prediction_rows", "metric_value": int(len(predictions))},
-            {"metric_name": "input_price_rows", "metric_value": int(len(prices))},
-            {"metric_name": "prob_threshold", "metric_value": float(args.prob_threshold)},
-            {"metric_name": "min_prob_percentile", "metric_value": float(args.min_prob_percentile)},
-            {"metric_name": "prob_percentile_cutoff_value", "metric_value": prob_percentile_cutoff_value},
-            {"metric_name": "ranking_mode", "metric_value": None},
-            {"metric_name": "rank_score_min", "metric_value": float(args.rank_score_min) if args.rank_score_min is not None else None},
-            {"metric_name": "prob_zscore_weight", "metric_value": float(args.prob_zscore_weight)},
-            {"metric_name": "percentile_weight", "metric_value": float(args.percentile_weight)},
-            {"metric_name": "volatility_weight", "metric_value": float(args.volatility_weight)},
-            {"metric_name": "time_to_peak_weight", "metric_value": float(args.time_to_peak_weight)},
-            {"metric_name": "enable_dynamic_max_positions", "metric_value": int(args.enable_dynamic_max_positions)},
-            {"metric_name": "min_dynamic_max_positions", "metric_value": int(args.min_dynamic_max_positions)},
-            {"metric_name": "dynamic_position_score_threshold", "metric_value": float(args.dynamic_position_score_threshold)},
-            {
-                "metric_name": "min_rolling_volatility_24h",
-                "metric_value": float(args.min_rolling_volatility_24h) if args.min_rolling_volatility_24h is not None else None,
-            },
-            {
-                "metric_name": "max_predicted_time_to_peak_hours",
-                "metric_value": float(args.max_predicted_time_to_peak_hours) if args.max_predicted_time_to_peak_hours is not None else None,
-            },
-            {"metric_name": "enable_dynamic_sizing", "metric_value": int(args.enable_dynamic_sizing)},
-            {"metric_name": "prob_size_cap", "metric_value": float(args.prob_size_cap)},
-            {"metric_name": "vol_reference", "metric_value": float(args.vol_reference)},
-            {"metric_name": "vol_size_floor", "metric_value": float(args.vol_size_floor)},
-            {"metric_name": "vol_size_cap", "metric_value": float(args.vol_size_cap)},
-            {"metric_name": "combined_size_cap", "metric_value": float(args.combined_size_cap)},
-            {"metric_name": "enable_kelly_sizing", "metric_value": int(args.enable_kelly_sizing)},
-            {"metric_name": "kelly_fraction_scale", "metric_value": float(args.kelly_fraction_scale)},
-            {"metric_name": "kelly_size_cap", "metric_value": float(args.kelly_size_cap)},
-            {"metric_name": "min_notional_per_trade", "metric_value": float(args.min_notional_per_trade)},
-            {"metric_name": "top_n", "metric_value": int(args.top_n)},
-            {"metric_name": "max_positions", "metric_value": int(args.max_positions)},
-            {"metric_name": "notional_per_trade", "metric_value": float(args.notional_per_trade)},
-            {"metric_name": "take_profit_pct", "metric_value": float(args.take_profit_pct)},
-            {"metric_name": "stop_loss_pct", "metric_value": float(args.stop_loss_pct)},
-            {"metric_name": "trailing_stop_pct", "metric_value": float(args.trailing_stop_pct)},
-            {"metric_name": "trailing_stop_activation_pct", "metric_value": float(args.trailing_stop_activation_pct)},
-            {"metric_name": "partial_take_profit_pct", "metric_value": float(args.partial_take_profit_pct)},
-            {"metric_name": "partial_take_profit_fraction", "metric_value": float(args.partial_take_profit_fraction)},
-            {"metric_name": "time_stop_hours", "metric_value": float(args.time_stop_hours) if args.time_stop_hours is not None else None},
-            {"metric_name": "time_stop_min_return_pct", "metric_value": float(args.time_stop_min_return_pct)},
-            {"metric_name": "max_hold_hours", "metric_value": float(args.max_hold_hours)},
-            {"metric_name": "enable_risk_manager", "metric_value": int(args.enable_risk_manager)},
-            {"metric_name": "max_daily_loss_usd", "metric_value": float(args.max_daily_loss_usd) if args.max_daily_loss_usd is not None else None},
-            {"metric_name": "max_total_exposure_usd", "metric_value": float(args.max_total_exposure_usd) if args.max_total_exposure_usd is not None else None},
-            {"metric_name": "max_total_exposure_pct", "metric_value": float(args.max_total_exposure_pct) if args.max_total_exposure_pct is not None else None},
-            {"metric_name": "max_exposure_per_symbol_usd", "metric_value": float(args.max_exposure_per_symbol_usd) if args.max_exposure_per_symbol_usd is not None else None},
-            {"metric_name": "max_drawdown_pct", "metric_value": float(args.max_drawdown_pct) if args.max_drawdown_pct is not None else None},
-            {"metric_name": "cooldown_minutes_per_symbol", "metric_value": float(args.cooldown_minutes_per_symbol)},
-            {"metric_name": "enable_drawdown_scaling", "metric_value": int(args.enable_drawdown_scaling)},
-            {"metric_name": "drawdown_full_size_pct", "metric_value": float(args.drawdown_full_size_pct)},
-            {"metric_name": "drawdown_half_size_pct", "metric_value": float(args.drawdown_half_size_pct)},
-            {"metric_name": "drawdown_quarter_size_pct", "metric_value": float(args.drawdown_quarter_size_pct)},
-            {"metric_name": "drawdown_half_size_multiplier", "metric_value": float(args.drawdown_half_size_multiplier)},
-            {"metric_name": "drawdown_quarter_size_multiplier", "metric_value": float(args.drawdown_quarter_size_multiplier)},
-            {"metric_name": "timestamps_considered", "metric_value": diagnostics.timestamps_considered},
-            {"metric_name": "candidate_rows_seen", "metric_value": diagnostics.candidate_rows_seen},
-            {"metric_name": "candidate_rows_after_prob_threshold", "metric_value": diagnostics.candidate_rows_after_prob_threshold},
-            {"metric_name": "candidate_rows_after_percentile", "metric_value": diagnostics.candidate_rows_after_percentile},
-            {"metric_name": "candidate_rows_after_volatility", "metric_value": diagnostics.candidate_rows_after_volatility},
-            {"metric_name": "candidate_rows_after_time_to_peak", "metric_value": diagnostics.candidate_rows_after_time_to_peak},
-            {"metric_name": "candidate_rows_after_rank_score", "metric_value": diagnostics.candidate_rows_after_rank_score},
-            {"metric_name": "entries_submitted", "metric_value": diagnostics.entries_submitted},
-            {"metric_name": "entries_opened", "metric_value": diagnostics.entries_opened},
-            {"metric_name": "skipped_already_open", "metric_value": diagnostics.skipped_already_open},
-            {"metric_name": "skipped_missing_price", "metric_value": diagnostics.skipped_missing_price},
-            {"metric_name": "skipped_cash", "metric_value": diagnostics.skipped_cash},
-            {"metric_name": "skipped_position_cap", "metric_value": diagnostics.skipped_position_cap},
-            {"metric_name": "sized_below_min_notional", "metric_value": diagnostics.sized_below_min_notional},
-            {"metric_name": "partial_take_profit_events", "metric_value": diagnostics.partial_take_profit_events},
-            {"metric_name": "trailing_stop_exits", "metric_value": diagnostics.trailing_stop_exits},
-            {"metric_name": "time_stop_exits", "metric_value": diagnostics.time_stop_exits},
-            {"metric_name": "daily_loss_triggered", "metric_value": diagnostics.daily_loss_triggered},
-            {"metric_name": "exposure_violations", "metric_value": diagnostics.exposure_violations},
-            {"metric_name": "trades_blocked_by_risk", "metric_value": diagnostics.trades_blocked_by_risk},
-            {"metric_name": "forced_exits", "metric_value": diagnostics.forced_exits},
-            {"metric_name": "kill_switch_activations", "metric_value": risk_metrics["kill_switch_activations"]},
-            {"metric_name": "drawdown_breach_events", "metric_value": risk_metrics["drawdown_breach_events"]},
-            {"metric_name": "cooldown_blocks", "metric_value": risk_metrics["cooldown_blocks"]},
-            {"metric_name": "daily_loss_blocks", "metric_value": risk_metrics["daily_loss_blocks"]},
-            {"metric_name": "risk_safe_mode_active", "metric_value": risk_metrics["safe_mode_active"]},
-            {"metric_name": "risk_kill_switch_active", "metric_value": risk_metrics["kill_switch_active"]},
-            {"metric_name": "ending_total_exposure_usd", "metric_value": risk_metrics["ending_total_exposure_usd"]},
-            {"metric_name": "ending_daily_pnl_usd", "metric_value": risk_metrics["ending_daily_pnl_usd"]},
-            {"metric_name": "ending_drawdown_pct", "metric_value": risk_metrics["ending_drawdown_pct"]},
-            {"metric_name": "drawdown_scaling_half_count", "metric_value": risk_metrics["drawdown_scaling_half_count"]},
-            {"metric_name": "drawdown_scaling_quarter_count", "metric_value": risk_metrics["drawdown_scaling_quarter_count"]},
-            {"metric_name": "drawdown_scaling_stop_count", "metric_value": risk_metrics["drawdown_scaling_stop_count"]},
-            {"metric_name": "candidate_rate_after_prob_threshold", "metric_value": (diagnostics.candidate_rows_after_prob_threshold / diagnostics.candidate_rows_seen) if diagnostics.candidate_rows_seen else None},
-            {"metric_name": "entry_open_rate", "metric_value": (diagnostics.entries_opened / diagnostics.entries_submitted) if diagnostics.entries_submitted else None},
-            {"metric_name": "trade_rate_vs_candidates", "metric_value": (total_trades / diagnostics.candidate_rows_after_prob_threshold) if diagnostics.candidate_rows_after_prob_threshold else None},
-            {"metric_name": "trades", "metric_value": total_trades},
-            {"metric_name": "wins", "metric_value": wins},
-            {"metric_name": "losses", "metric_value": losses},
-            {"metric_name": "win_rate", "metric_value": win_rate},
-            {"metric_name": "total_pnl_usd", "metric_value": total_pnl},
-            {"metric_name": "avg_pnl_usd", "metric_value": avg_pnl},
-            {"metric_name": "avg_return_pct", "metric_value": avg_return},
-            {"metric_name": "avg_hold_hours", "metric_value": avg_hold},
-            {"metric_name": "avg_notional_usd", "metric_value": avg_notional},
-            {"metric_name": "avg_entry_score", "metric_value": avg_entry_score},
-            {"metric_name": "avg_prob_size_multiplier", "metric_value": avg_prob_mult},
-            {"metric_name": "avg_vol_size_multiplier", "metric_value": avg_vol_mult},
-            {"metric_name": "avg_kelly_fraction", "metric_value": avg_kelly_fraction},
-            {"metric_name": "avg_kelly_multiplier", "metric_value": avg_kelly_mult},
-            {"metric_name": "avg_total_size_multiplier", "metric_value": avg_total_mult},
-            {"metric_name": "starting_equity_usd", "metric_value": float(args.initial_cash)},
-            {"metric_name": "ending_equity_usd", "metric_value": ending_equity},
-            {"metric_name": "total_return_pct", "metric_value": float(total_return)},
-            {"metric_name": "max_drawdown_pct", "metric_value": float(max_drawdown)},
-        ]
+        {"metric_name": "input_prediction_rows", "metric_value": int(len(predictions))},
+        {"metric_name": "input_price_rows", "metric_value": int(len(prices))},
+        {"metric_name": "prediction_source", "metric_value": None},
+        {"metric_name": "resolved_prob_column", "metric_value": None},
+        {"metric_name": "resolved_score_column", "metric_value": None},
+        {"metric_name": "prob_threshold", "metric_value": float(args.prob_threshold)},
+        {"metric_name": "min_prob_percentile", "metric_value": float(args.min_prob_percentile)},
+        {"metric_name": "prob_percentile_cutoff_value", "metric_value": prob_percentile_cutoff_value},
+        {"metric_name": "ranking_mode", "metric_value": None},
+        {"metric_name": "rank_score_min", "metric_value": float(args.rank_score_min) if args.rank_score_min is not None else None},
+        {"metric_name": "prob_zscore_weight", "metric_value": float(args.prob_zscore_weight)},
+        {"metric_name": "percentile_weight", "metric_value": float(args.percentile_weight)},
+        {"metric_name": "volatility_weight", "metric_value": float(args.volatility_weight)},
+        {"metric_name": "time_to_peak_weight", "metric_value": float(args.time_to_peak_weight)},
+        {"metric_name": "enable_dynamic_max_positions", "metric_value": int(args.enable_dynamic_max_positions)},
+        {"metric_name": "min_dynamic_max_positions", "metric_value": int(args.min_dynamic_max_positions)},
+        {"metric_name": "dynamic_position_score_threshold", "metric_value": float(args.dynamic_position_score_threshold)},
+        {
+            "metric_name": "min_rolling_volatility_24h",
+            "metric_value": float(args.min_rolling_volatility_24h) if args.min_rolling_volatility_24h is not None else None,
+        },
+        {
+            "metric_name": "max_predicted_time_to_peak_hours",
+            "metric_value": float(args.max_predicted_time_to_peak_hours) if args.max_predicted_time_to_peak_hours is not None else None,
+        },
+        {"metric_name": "enable_dynamic_sizing", "metric_value": int(args.enable_dynamic_sizing)},
+        {"metric_name": "prob_size_cap", "metric_value": float(args.prob_size_cap)},
+        {"metric_name": "vol_reference", "metric_value": float(args.vol_reference)},
+        {"metric_name": "vol_size_floor", "metric_value": float(args.vol_size_floor)},
+        {"metric_name": "vol_size_cap", "metric_value": float(args.vol_size_cap)},
+        {"metric_name": "combined_size_cap", "metric_value": float(args.combined_size_cap)},
+        {"metric_name": "enable_kelly_sizing", "metric_value": int(args.enable_kelly_sizing)},
+        {"metric_name": "kelly_fraction_scale", "metric_value": float(args.kelly_fraction_scale)},
+        {"metric_name": "kelly_size_cap", "metric_value": float(args.kelly_size_cap)},
+        {"metric_name": "min_notional_per_trade", "metric_value": float(args.min_notional_per_trade)},
+        {"metric_name": "top_n", "metric_value": int(args.top_n)},
+        {"metric_name": "max_positions", "metric_value": int(args.max_positions)},
+        {"metric_name": "notional_per_trade", "metric_value": float(args.notional_per_trade)},
+        {"metric_name": "take_profit_pct", "metric_value": float(args.take_profit_pct)},
+        {"metric_name": "stop_loss_pct", "metric_value": float(args.stop_loss_pct)},
+        {"metric_name": "trailing_stop_pct", "metric_value": float(args.trailing_stop_pct)},
+        {"metric_name": "trailing_stop_activation_pct", "metric_value": float(args.trailing_stop_activation_pct)},
+        {"metric_name": "partial_take_profit_pct", "metric_value": float(args.partial_take_profit_pct)},
+        {"metric_name": "partial_take_profit_fraction", "metric_value": float(args.partial_take_profit_fraction)},
+        {"metric_name": "time_stop_hours", "metric_value": float(args.time_stop_hours) if args.time_stop_hours is not None else None},
+        {"metric_name": "time_stop_min_return_pct", "metric_value": float(args.time_stop_min_return_pct)},
+        {"metric_name": "max_hold_hours", "metric_value": float(args.max_hold_hours)},
+        {"metric_name": "enable_risk_manager", "metric_value": int(args.enable_risk_manager)},
+        {"metric_name": "max_daily_loss_usd", "metric_value": float(args.max_daily_loss_usd) if args.max_daily_loss_usd is not None else None},
+        {"metric_name": "max_total_exposure_usd", "metric_value": float(args.max_total_exposure_usd) if args.max_total_exposure_usd is not None else None},
+        {"metric_name": "max_total_exposure_pct", "metric_value": float(args.max_total_exposure_pct) if args.max_total_exposure_pct is not None else None},
+        {"metric_name": "max_exposure_per_symbol_usd", "metric_value": float(args.max_exposure_per_symbol_usd) if args.max_exposure_per_symbol_usd is not None else None},
+        {"metric_name": "max_drawdown_pct", "metric_value": float(args.max_drawdown_pct) if args.max_drawdown_pct is not None else None},
+        {"metric_name": "cooldown_minutes_per_symbol", "metric_value": float(args.cooldown_minutes_per_symbol)},
+        {"metric_name": "enable_drawdown_scaling", "metric_value": int(args.enable_drawdown_scaling)},
+        {"metric_name": "drawdown_full_size_pct", "metric_value": float(args.drawdown_full_size_pct)},
+        {"metric_name": "drawdown_half_size_pct", "metric_value": float(args.drawdown_half_size_pct)},
+        {"metric_name": "drawdown_quarter_size_pct", "metric_value": float(args.drawdown_quarter_size_pct)},
+        {"metric_name": "drawdown_half_size_multiplier", "metric_value": float(args.drawdown_half_size_multiplier)},
+        {"metric_name": "drawdown_quarter_size_multiplier", "metric_value": float(args.drawdown_quarter_size_multiplier)},
+        {"metric_name": "timestamps_considered", "metric_value": diagnostics.timestamps_considered},
+        {"metric_name": "candidate_rows_seen", "metric_value": diagnostics.candidate_rows_seen},
+        {"metric_name": "candidate_rows_after_prob_threshold", "metric_value": diagnostics.candidate_rows_after_prob_threshold},
+        {"metric_name": "candidate_rows_after_percentile", "metric_value": diagnostics.candidate_rows_after_percentile},
+        {"metric_name": "candidate_rows_after_volatility", "metric_value": diagnostics.candidate_rows_after_volatility},
+        {"metric_name": "candidate_rows_after_time_to_peak", "metric_value": diagnostics.candidate_rows_after_time_to_peak},
+        {"metric_name": "candidate_rows_after_rank_score", "metric_value": diagnostics.candidate_rows_after_rank_score},
+        {"metric_name": "entries_submitted", "metric_value": diagnostics.entries_submitted},
+        {"metric_name": "entries_opened", "metric_value": diagnostics.entries_opened},
+        {"metric_name": "skipped_already_open", "metric_value": diagnostics.skipped_already_open},
+        {"metric_name": "skipped_missing_price", "metric_value": diagnostics.skipped_missing_price},
+        {"metric_name": "skipped_cash", "metric_value": diagnostics.skipped_cash},
+        {"metric_name": "skipped_position_cap", "metric_value": diagnostics.skipped_position_cap},
+        {"metric_name": "sized_below_min_notional", "metric_value": diagnostics.sized_below_min_notional},
+        {"metric_name": "partial_take_profit_events", "metric_value": diagnostics.partial_take_profit_events},
+        {"metric_name": "trailing_stop_exits", "metric_value": diagnostics.trailing_stop_exits},
+        {"metric_name": "time_stop_exits", "metric_value": diagnostics.time_stop_exits},
+        {"metric_name": "daily_loss_triggered", "metric_value": diagnostics.daily_loss_triggered},
+        {"metric_name": "exposure_violations", "metric_value": diagnostics.exposure_violations},
+        {"metric_name": "trades_blocked_by_risk", "metric_value": diagnostics.trades_blocked_by_risk},
+        {"metric_name": "forced_exits", "metric_value": diagnostics.forced_exits},
+        {"metric_name": "kill_switch_activations", "metric_value": risk_metrics["kill_switch_activations"]},
+        {"metric_name": "drawdown_breach_events", "metric_value": risk_metrics["drawdown_breach_events"]},
+        {"metric_name": "cooldown_blocks", "metric_value": risk_metrics["cooldown_blocks"]},
+        {"metric_name": "daily_loss_blocks", "metric_value": risk_metrics["daily_loss_blocks"]},
+        {"metric_name": "risk_safe_mode_active", "metric_value": risk_metrics["safe_mode_active"]},
+        {"metric_name": "risk_kill_switch_active", "metric_value": risk_metrics["kill_switch_active"]},
+        {"metric_name": "ending_total_exposure_usd", "metric_value": risk_metrics["ending_total_exposure_usd"]},
+        {"metric_name": "ending_daily_pnl_usd", "metric_value": risk_metrics["ending_daily_pnl_usd"]},
+        {"metric_name": "ending_drawdown_pct", "metric_value": risk_metrics["ending_drawdown_pct"]},
+        {"metric_name": "drawdown_scaling_half_count", "metric_value": risk_metrics["drawdown_scaling_half_count"]},
+        {"metric_name": "drawdown_scaling_quarter_count", "metric_value": risk_metrics["drawdown_scaling_quarter_count"]},
+        {"metric_name": "drawdown_scaling_stop_count", "metric_value": risk_metrics["drawdown_scaling_stop_count"]},
+        {"metric_name": "candidate_rate_after_prob_threshold", "metric_value": (diagnostics.candidate_rows_after_prob_threshold / diagnostics.candidate_rows_seen) if diagnostics.candidate_rows_seen else None},
+        {"metric_name": "entry_open_rate", "metric_value": (diagnostics.entries_opened / diagnostics.entries_submitted) if diagnostics.entries_submitted else None},
+        {"metric_name": "trade_rate_vs_candidates", "metric_value": (total_trades / diagnostics.candidate_rows_after_prob_threshold) if diagnostics.candidate_rows_after_prob_threshold else None},
+        {"metric_name": "trades", "metric_value": total_trades},
+        {"metric_name": "wins", "metric_value": wins},
+        {"metric_name": "losses", "metric_value": losses},
+        {"metric_name": "win_rate", "metric_value": win_rate},
+        {"metric_name": "total_pnl_usd", "metric_value": total_pnl},
+        {"metric_name": "avg_pnl_usd", "metric_value": avg_pnl},
+        {"metric_name": "avg_return_pct", "metric_value": avg_return},
+        {"metric_name": "avg_hold_hours", "metric_value": avg_hold},
+        {"metric_name": "avg_notional_usd", "metric_value": avg_notional},
+        {"metric_name": "avg_entry_score", "metric_value": avg_entry_score},
+        {"metric_name": "avg_prob_size_multiplier", "metric_value": avg_prob_mult},
+        {"metric_name": "avg_vol_size_multiplier", "metric_value": avg_vol_mult},
+        {"metric_name": "avg_kelly_fraction", "metric_value": avg_kelly_fraction},
+        {"metric_name": "avg_kelly_multiplier", "metric_value": avg_kelly_mult},
+        {"metric_name": "avg_total_size_multiplier", "metric_value": avg_total_mult},
+        {"metric_name": "starting_equity_usd", "metric_value": float(args.initial_cash)},
+        {"metric_name": "ending_equity_usd", "metric_value": ending_equity},
+        {"metric_name": "total_return_pct", "metric_value": float(total_return)},
+        {"metric_name": "max_drawdown_pct", "metric_value": float(max_drawdown)},
+    ]
     summary_df = pd.DataFrame(summary_rows)
     summary_df["metric_value"] = summary_df["metric_value"].astype(object)
     summary_df.loc[summary_df["metric_name"] == "ranking_mode", "metric_value"] = args.ranking_mode
+    summary_df.loc[summary_df["metric_name"] == "prediction_source", "metric_value"] = args.prediction_source
+    summary_df.loc[summary_df["metric_name"] == "resolved_prob_column", "metric_value"] = args.prob_column
+    summary_df.loc[summary_df["metric_name"] == "resolved_score_column", "metric_value"] = resolved_score_col
 
     return trades_df, equity_df, summary_df
 
@@ -1003,7 +1092,6 @@ def write_table(conn: sqlite3.Connection, df: pd.DataFrame, table_name: str, if_
 
 
 def run_replay(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """Backwards-compatible callable entry point for other scripts."""
     conn = sqlite3.connect(args.db_path)
     try:
         predictions = load_predictions(conn, args)
@@ -1032,13 +1120,14 @@ def main() -> int:
         predictions = enrich_predictions(predictions, context, args)
 
         LOGGER.info(
-            "Loaded predictions=%d rows from %s, prices=%d rows from %s, context=%d rows from %s",
+            "Loaded predictions=%d rows from %s, prices=%d rows from %s, context=%d rows from %s, source=%s",
             len(predictions),
             args.predictions_table,
             len(prices),
             args.price_table,
             len(context),
             args.context_table,
+            args.prediction_source,
         )
 
         trades_df, equity_df, summary_df = replay_strategy(predictions, prices, args)

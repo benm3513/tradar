@@ -2,10 +2,20 @@
 """Build time-aware spike labels from a historical base dataset.
 
 This script reads an asset/timestamp price table from SQLite, computes forward
-elapsed-time spike targets, and writes an output label table. It now supports:
-- looser default thresholds for better recall
-- explicit per-horizon threshold overrides
-- percentile-based spike definitions per asset stream
+elapsed-time spike targets, and writes an output label table.
+
+Phase 4.7 upgrades
+------------------
+- Multi-horizon label support aligned with upgraded labels.py
+- Optional percentile-resolved thresholds via resolve_percentiles=True
+- Stable alias columns for downstream model training:
+    - spike_6h_label
+    - spike_24h_label
+    - spike_72h_label
+    - tradeable_pre_spike_6h_label
+    - ...
+- Explicit applied-threshold columns written per horizon
+- Backward-compatible support for absolute and percentile modes
 
 Examples
 --------
@@ -15,13 +25,13 @@ Absolute threshold mode:
   --source-table spike_base_rows \
   --output-table spike_labeled_rows
 
-Percentile mode (top 8% spikes per symbol on 24h target):
+Percentile mode:
 ./.venv/bin/python scripts/build_spike_labels.py \
   --db-path tradarbot.db \
   --source-table spike_base_rows \
   --output-table spike_labeled_rows \
   --label-mode percentile \
-  --percentile-threshold-24h 0.92
+  --percentile-threshold-24h 0.985
 """
 
 from __future__ import annotations
@@ -30,12 +40,13 @@ import argparse
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Sequence
+from typing import Mapping, Sequence
 
 import pandas as pd
 
 from tradarbot.research.spikes.labels import (
     DEFAULT_LABEL_CONFIGS,
+    PERCENTILE_LABEL_CONFIGS,
     SpikeLabelConfig,
     merge_labels_onto_frame,
 )
@@ -71,9 +82,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--label-mode", choices=("absolute", "percentile"), default="absolute")
     parser.add_argument("--tradeable-entry-to-peak-ratio", type=float, default=0.92)
     parser.add_argument("--tradeable-max-pre-peak-drawdown", type=float, default=0.45)
+    parser.add_argument(
+        "--min-resolved-rows",
+        type=int,
+        default=25,
+        help="Minimum non-null future-return rows required before percentile thresholds are resolved.",
+    )
 
     for horizon in SUPPORTED_HORIZONS:
-        key = horizon.replace("d", "d").replace("h", "h")
         parser.add_argument(f"--spike-threshold-{horizon}", type=float, default=None)
         parser.add_argument(f"--tradeable-min-return-{horizon}", type=float, default=None)
         parser.add_argument(f"--percentile-threshold-{horizon}", type=float, default=None)
@@ -149,72 +165,72 @@ def sort_frame(frame: pd.DataFrame, *, asset_key_columns: Sequence[str], timesta
     return sorted_frame
 
 
+def _base_config_map_for_mode(label_mode: str) -> Mapping[str, SpikeLabelConfig]:
+    if label_mode == "percentile":
+        return PERCENTILE_LABEL_CONFIGS
+    return DEFAULT_LABEL_CONFIGS
+
+
 def build_label_configs(args: argparse.Namespace) -> dict[str, SpikeLabelConfig]:
+    base_config_map = _base_config_map_for_mode(args.label_mode)
     configs: dict[str, SpikeLabelConfig] = {}
-    for horizon, base_cfg in DEFAULT_LABEL_CONFIGS.items():
+
+    for horizon in SUPPORTED_HORIZONS:
+        base_cfg = base_config_map[horizon]
         spike_threshold = getattr(args, f"spike_threshold_{horizon}", None)
         tradeable_min_return = getattr(args, f"tradeable_min_return_{horizon}", None)
+        percentile_threshold = getattr(args, f"percentile_threshold_{horizon}", None)
+
         configs[horizon] = SpikeLabelConfig(
             horizon=base_cfg.horizon,
-            spike_threshold_return=float(base_cfg.spike_threshold_return if spike_threshold is None else spike_threshold),
-            tradeable_min_return=float(base_cfg.tradeable_min_return if tradeable_min_return is None else tradeable_min_return),
+            spike_threshold_return=float(
+                base_cfg.spike_threshold_return if spike_threshold is None else spike_threshold
+            ),
+            tradeable_min_return=float(
+                base_cfg.tradeable_min_return if tradeable_min_return is None else tradeable_min_return
+            ),
             tradeable_entry_to_peak_ratio=float(args.tradeable_entry_to_peak_ratio),
             tradeable_max_pre_peak_drawdown=float(args.tradeable_max_pre_peak_drawdown),
+            spike_threshold_percentile=(
+                base_cfg.spike_threshold_percentile
+                if percentile_threshold is None
+                else float(percentile_threshold)
+            ),
+            tradeable_min_return_percentile=(
+                base_cfg.tradeable_min_return_percentile
+                if percentile_threshold is None
+                else float(percentile_threshold)
+            ),
+            min_resolved_rows=int(args.min_resolved_rows),
         )
+
     return configs
 
 
-def _resolve_label_threshold(asset_frame: pd.DataFrame, horizon: str, args: argparse.Namespace, configs: dict[str, SpikeLabelConfig]) -> float:
-    if args.label_mode == "absolute":
-        return float(configs[horizon].spike_threshold_return)
+def _copy_threshold_alias_columns(
+    labeled: pd.DataFrame,
+    *,
+    configs: Mapping[str, SpikeLabelConfig],
+    resolve_percentiles: bool,
+) -> pd.DataFrame:
+    out = labeled.copy()
 
-    percentile = getattr(args, f"percentile_threshold_{horizon}", None)
-    if percentile is None:
-        percentile = 0.92 if horizon == "24h" else 0.90
-    percentile = float(percentile)
-    if not (0.0 < percentile < 1.0):
-        raise BuildSpikeLabelsError(f"percentile threshold for {horizon} must be between 0 and 1")
-
-    target_col = f"target_future_max_return_{horizon}"
-    eligible = pd.to_numeric(asset_frame[target_col], errors="coerce").dropna()
-    if eligible.empty:
-        return float(configs[horizon].spike_threshold_return)
-    return float(eligible.quantile(percentile))
-
-
-def relabel_asset_frame(asset_frame: pd.DataFrame, args: argparse.Namespace, configs: dict[str, SpikeLabelConfig]) -> pd.DataFrame:
-    out = asset_frame.copy()
     for horizon in SUPPORTED_HORIZONS:
-        cfg = configs[horizon]
-        min_return = getattr(args, f"tradeable_min_return_{horizon}", None)
-        label_threshold = _resolve_label_threshold(out, horizon, args, configs)
-        tradeable_min_return = float(label_threshold if min_return is None else min_return)
+        threshold_src = f"threshold_spike_return_{horizon}"
+        tradeable_threshold_src = f"threshold_tradeable_return_{horizon}"
 
-        target_return_col = f"target_future_max_return_{horizon}"
-        target_peak_col = f"target_future_peak_price_{horizon}"
-        pre_peak_dd_col = f"target_pre_peak_drawdown_{horizon}"
-        label_spike_col = f"label_spike_{horizon}"
-        label_tradeable_col = f"label_tradeable_pre_spike_{horizon}"
-        threshold_col = f"applied_spike_threshold_{horizon}"
+        if threshold_src not in out.columns:
+            out[threshold_src] = float(configs[horizon].spike_threshold_return)
 
-        future_return = pd.to_numeric(out[target_return_col], errors="coerce")
-        future_peak = pd.to_numeric(out[target_peak_col], errors="coerce")
-        pre_peak_drawdown = pd.to_numeric(out[pre_peak_dd_col], errors="coerce")
-        current_price = pd.to_numeric(out["price_close"], errors="coerce")
+        if tradeable_threshold_src not in out.columns:
+            out[tradeable_threshold_src] = float(configs[horizon].tradeable_min_return)
 
-        spike_mask = future_return.notna()
-        out[label_spike_col] = pd.Series(pd.NA, index=out.index, dtype="object")
-        out.loc[spike_mask, label_spike_col] = (future_return[spike_mask] >= label_threshold).astype(int)
-
-        tradeable_mask = future_return.notna() & future_peak.notna() & pre_peak_drawdown.notna() & current_price.notna()
-        early_enough = current_price <= (float(cfg.tradeable_entry_to_peak_ratio) * future_peak)
-        return_ok = future_return >= tradeable_min_return
-        drawdown_ok = pre_peak_drawdown <= float(cfg.tradeable_max_pre_peak_drawdown)
-        tradeable = (early_enough & return_ok & drawdown_ok).astype(int)
-
-        out[label_tradeable_col] = pd.Series(pd.NA, index=out.index, dtype="object")
-        out.loc[tradeable_mask, label_tradeable_col] = tradeable[tradeable_mask]
-        out[threshold_col] = float(label_threshold)
+        out[f"applied_spike_threshold_{horizon}"] = pd.to_numeric(out[threshold_src], errors="coerce")
+        out[f"applied_tradeable_min_return_{horizon}"] = pd.to_numeric(
+            out[tradeable_threshold_src],
+            errors="coerce",
+        )
+        out[f"label_mode_{horizon}"] = "percentile" if resolve_percentiles else "absolute"
 
     return out
 
@@ -229,11 +245,23 @@ def build_labels_for_all_assets(
     args: argparse.Namespace,
 ) -> pd.DataFrame:
     output_groups: list[pd.DataFrame] = []
+    resolve_percentiles = args.label_mode == "percentile"
 
     for asset_key, asset_frame in frame.groupby(list(asset_key_columns), sort=False, dropna=False):
         asset_frame = asset_frame.sort_values(timestamp_column).reset_index(drop=True)
-        labeled = merge_labels_onto_frame(asset_frame, price_column=price_column, configs=configs)
-        labeled = relabel_asset_frame(labeled, args, configs)
+
+        labeled = merge_labels_onto_frame(
+            asset_frame,
+            price_column=price_column,
+            timestamp_column=timestamp_column,
+            configs=configs,
+            resolve_percentiles=resolve_percentiles,
+        )
+        labeled = _copy_threshold_alias_columns(
+            labeled,
+            configs=configs,
+            resolve_percentiles=resolve_percentiles,
+        )
         output_groups.append(labeled)
 
         asset_key_tuple = asset_key if isinstance(asset_key, tuple) else (asset_key,)
@@ -247,14 +275,25 @@ def build_labels_for_all_assets(
 
 def build_summary_frame(labeled_frame: pd.DataFrame) -> pd.DataFrame:
     summary_rows: list[dict[str, object]] = []
-    label_columns = sorted(col for col in labeled_frame.columns if col.startswith("label_"))
+
+    label_columns = sorted(
+        col for col in labeled_frame.columns
+        if col.startswith("label_") or col.endswith("_label")
+    )
     target_columns = sorted(col for col in labeled_frame.columns if col.startswith("target_future_max_return_"))
-    applied_threshold_columns = sorted(col for col in labeled_frame.columns if col.startswith("applied_spike_threshold_"))
+    applied_threshold_columns = sorted(
+        col for col in labeled_frame.columns
+        if col.startswith("applied_spike_threshold_") or col.startswith("applied_tradeable_min_return_")
+    )
 
     for column in label_columns:
         non_null = labeled_frame[column].notna()
         eligible_rows = int(non_null.sum())
-        positive_rows = int(pd.to_numeric(labeled_frame.loc[non_null, column], errors="coerce").fillna(0).sum()) if eligible_rows else 0
+        positive_rows = (
+            int(pd.to_numeric(labeled_frame.loc[non_null, column], errors="coerce").fillna(0).sum())
+            if eligible_rows
+            else 0
+        )
         positive_rate = (positive_rows / eligible_rows) if eligible_rows else None
         summary_rows.append(
             {
@@ -325,6 +364,7 @@ def main() -> int:
             source_frame.groupby(asset_key_columns, dropna=False).ngroups,
             args.label_mode,
         )
+
         labeled_frame = build_labels_for_all_assets(
             source_frame,
             asset_key_columns=asset_key_columns,

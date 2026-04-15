@@ -4,6 +4,21 @@
 This script sweeps parameter combinations for ``scripts/replay_ml_strategy.py``,
 collects replay outputs, persists per-run artifacts, and writes ranked sweep
 results to SQLite.
+
+Phase 4.7 upgrades
+------------------
+- Supports replay prediction sources:
+    - ensemble
+    - 6h
+    - 24h
+    - 72h
+    - direct
+- Supports ensemble-weight sweeps:
+    --weight-6h
+    --weight-24h
+    --weight-72h
+- Optionally rebuilds ensemble predictions before each replay run
+- Captures prediction-source and resolved column metadata in sweep results
 """
 
 from __future__ import annotations
@@ -15,17 +30,25 @@ import sqlite3
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 
 LOGGER = logging.getLogger("sweep_ml_replay")
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import replay_ml_strategy as replay_mod  # noqa: E402
+
+try:
+    from tradarbot.ml.ensemble import build_ensemble_predictions as build_ensemble_predictions_mod
+except Exception:  # pragma: no cover
+    build_ensemble_predictions_mod = None
 
 
 @dataclass(frozen=True)
@@ -43,11 +66,19 @@ class SweepConfig:
     drawdown_quarter_size_pct: float
     drawdown_half_size_multiplier: float
     drawdown_quarter_size_multiplier: float
+    weight_6h: float
+    weight_24h: float
+    weight_72h: float
 
 
 @dataclass
 class SweepRow:
     run_id: int
+    prediction_source: str
+    predictions_table: str
+    weight_6h: float | None
+    weight_24h: float | None
+    weight_72h: float | None
     prob_threshold: float
     take_profit_pct: float
     stop_loss_pct: float
@@ -67,6 +98,8 @@ class SweepRow:
     drawdown_half_size_multiplier: float
     drawdown_quarter_size_multiplier: float
     ranking_mode: str | None
+    resolved_prob_column: str | None
+    resolved_score_column: str | None
     total_pnl_usd: float | None
     total_return_pct: float | None
     max_drawdown_pct_realized: float | None
@@ -96,6 +129,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--predictions-table", default="spike_model_predictions_hgb")
     parser.add_argument("--price-table", default="spike_base_rows")
     parser.add_argument("--context-table", default="spike_training_rows")
+
+    parser.add_argument(
+        "--prediction-source",
+        choices=["ensemble", "6h", "24h", "72h", "direct"],
+        default="direct",
+    )
+    parser.add_argument("--score-column", default=None)
 
     parser.add_argument("--prob-thresholds", nargs="+", type=float, required=True)
     parser.add_argument("--take-profit-pcts", nargs="+", type=float, required=True)
@@ -170,6 +210,65 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--drawdown-half-size-multipliers", nargs="+", type=float, default=[0.50])
     parser.add_argument("--drawdown-quarter-size-multipliers", nargs="+", type=float, default=[0.25])
 
+    parser.add_argument(
+        "--weight-6h",
+        nargs="+",
+        type=float,
+        default=[0.3],
+        help="Ensemble sweep weights for 6h model.",
+    )
+    parser.add_argument(
+        "--weight-24h",
+        nargs="+",
+        type=float,
+        default=[0.5],
+        help="Ensemble sweep weights for 24h model.",
+    )
+    parser.add_argument(
+        "--weight-72h",
+        nargs="+",
+        type=float,
+        default=[0.2],
+        help="Ensemble sweep weights for 72h model.",
+    )
+    parser.add_argument(
+        "--rebuild-ensemble-per-run",
+        action="store_true",
+        help="Recompute ensemble table before each run using the current weight combination.",
+    )
+    parser.add_argument(
+        "--ensemble-output-table",
+        default="spike_model_predictions_ensemble",
+        help="Destination table for rebuilt ensemble predictions.",
+    )
+    parser.add_argument(
+        "--ensemble-table-6h",
+        default="spike_model_predictions_6h",
+        help="6h prediction table used by the ensemble builder.",
+    )
+    parser.add_argument(
+        "--ensemble-table-24h",
+        default="spike_model_predictions_24h",
+        help="24h prediction table used by the ensemble builder.",
+    )
+    parser.add_argument(
+        "--ensemble-table-72h",
+        default="spike_model_predictions_72h",
+        help="72h prediction table used by the ensemble builder.",
+    )
+    parser.add_argument(
+        "--ensemble-agreement-threshold",
+        type=float,
+        default=0.8,
+        help="Agreement threshold passed to the ensemble builder.",
+    )
+    parser.add_argument(
+        "--ensemble-agreement-boost",
+        type=float,
+        default=0.05,
+        help="Agreement boost passed to the ensemble builder.",
+    )
+
     parser.add_argument("--results-table", default="ml_replay_sweep_results")
     parser.add_argument(
         "--summary-table-prefix",
@@ -198,6 +297,10 @@ def configure_logging(level: str) -> None:
     )
 
 
+def _weights_sum_to_one(weight_6h: float, weight_24h: float, weight_72h: float, tol: float = 1e-9) -> bool:
+    return abs((weight_6h + weight_24h + weight_72h) - 1.0) <= tol
+
+
 def build_grid(args: argparse.Namespace) -> list[SweepConfig]:
     configs: list[SweepConfig] = []
     for values in itertools.product(
@@ -214,12 +317,21 @@ def build_grid(args: argparse.Namespace) -> list[SweepConfig]:
         args.drawdown_quarter_size_pcts,
         args.drawdown_half_size_multipliers,
         args.drawdown_quarter_size_multipliers,
+        args.weight_6h,
+        args.weight_24h,
+        args.weight_72h,
     ):
         cfg = SweepConfig(*values)
         if not (
             cfg.drawdown_full_size_pct <= cfg.drawdown_half_size_pct
             <= cfg.drawdown_quarter_size_pct
             <= cfg.max_drawdown_pct
+        ):
+            continue
+        if args.prediction_source == "ensemble" and not _weights_sum_to_one(
+            cfg.weight_6h,
+            cfg.weight_24h,
+            cfg.weight_72h,
         ):
             continue
         configs.append(cfg)
@@ -289,12 +401,56 @@ def derive_pnl_to_drawdown(total_pnl_usd: float | None, max_drawdown_pct: float 
     return float(total_pnl_usd / denom)
 
 
+def build_ensemble_predictions(
+    *,
+    conn: sqlite3.Connection,
+    args: argparse.Namespace,
+    cfg: SweepConfig,
+) -> str:
+    if build_ensemble_predictions_mod is None:
+        raise RuntimeError(
+            "tradarbot.ml.ensemble.build_ensemble_predictions could not be imported. "
+            "Create/restore tradarbot/ml/ensemble.py before using ensemble sweep mode."
+        )
+
+    try:
+        build_ensemble_predictions_mod(
+            db_path=args.db_path,
+            w6=cfg.weight_6h,
+            w24=cfg.weight_24h,
+            w72=cfg.weight_72h,
+            agreement_boost=float(args.ensemble_agreement_boost),
+            threshold=float(args.ensemble_agreement_threshold),
+            table_6h=args.ensemble_table_6h,
+            table_24h=args.ensemble_table_24h,
+            table_72h=args.ensemble_table_72h,
+            output_table=args.ensemble_output_table,
+        )
+    except TypeError:
+        build_ensemble_predictions_mod(
+            db_path=args.db_path,
+            w6=cfg.weight_6h,
+            w24=cfg.weight_24h,
+            w72=cfg.weight_72h,
+            agreement_boost=float(args.ensemble_agreement_boost),
+            threshold=float(args.ensemble_agreement_threshold),
+        )
+
+    return args.ensemble_output_table
+
+
 def make_replay_args(args: argparse.Namespace, cfg: SweepConfig, run_id: int) -> argparse.Namespace:
+    predictions_table = args.predictions_table
+    if args.prediction_source == "ensemble" and args.rebuild_ensemble_per_run:
+        predictions_table = args.ensemble_output_table
+
     return argparse.Namespace(
         db_path=args.db_path,
-        predictions_table=args.predictions_table,
+        predictions_table=predictions_table,
         price_table=args.price_table,
         context_table=args.context_table,
+        prediction_source=args.prediction_source,
+        score_column=args.score_column,
         symbol_column=args.symbol_column,
         timestamp_column=args.timestamp_column,
         price_column=args.price_column,
@@ -389,11 +545,17 @@ def run_one(
 ) -> SweepRow:
     replay_args = make_replay_args(args, cfg, run_id)
 
+    if args.prediction_source == "ensemble" and args.rebuild_ensemble_per_run:
+        ensemble_table = build_ensemble_predictions(conn=conn, args=args, cfg=cfg)
+        replay_args.predictions_table = ensemble_table
+
     LOGGER.info(
-        "Sweep run %d: prob=%.4f tp=%.4f sl=%.4f top_n=%d max_pos=%d "
+        "Sweep run %d: source=%s preds=%s prob=%.4f tp=%.4f sl=%.4f top_n=%d max_pos=%d "
         "kelly=%.4f size_cap=%.4f max_dd=%.4f dd_full=%.4f dd_half=%.4f dd_qtr=%.4f "
-        "half_mult=%.2f qtr_mult=%.2f",
+        "half_mult=%.2f qtr_mult=%.2f w6=%.3f w24=%.3f w72=%.3f",
         run_id,
+        replay_args.prediction_source,
+        replay_args.predictions_table,
         cfg.prob_threshold,
         cfg.take_profit_pct,
         cfg.stop_loss_pct,
@@ -407,6 +569,9 @@ def run_one(
         cfg.drawdown_quarter_size_pct,
         cfg.drawdown_half_size_multiplier,
         cfg.drawdown_quarter_size_multiplier,
+        cfg.weight_6h,
+        cfg.weight_24h,
+        cfg.weight_72h,
     )
 
     predictions_df = replay_mod.load_predictions(conn, replay_args)
@@ -431,6 +596,11 @@ def run_one(
 
     row = SweepRow(
         run_id=run_id,
+        prediction_source=safe_text(metrics, "prediction_source") or replay_args.prediction_source,
+        predictions_table=replay_args.predictions_table,
+        weight_6h=cfg.weight_6h if replay_args.prediction_source == "ensemble" else None,
+        weight_24h=cfg.weight_24h if replay_args.prediction_source == "ensemble" else None,
+        weight_72h=cfg.weight_72h if replay_args.prediction_source == "ensemble" else None,
         prob_threshold=cfg.prob_threshold,
         take_profit_pct=cfg.take_profit_pct,
         stop_loss_pct=cfg.stop_loss_pct,
@@ -450,6 +620,8 @@ def run_one(
         drawdown_half_size_multiplier=cfg.drawdown_half_size_multiplier,
         drawdown_quarter_size_multiplier=cfg.drawdown_quarter_size_multiplier,
         ranking_mode=safe_text(metrics, "ranking_mode") or args.ranking_mode,
+        resolved_prob_column=safe_text(metrics, "resolved_prob_column"),
+        resolved_score_column=safe_text(metrics, "resolved_score_column"),
         total_pnl_usd=total_pnl_metric,
         total_return_pct=safe_metric(metrics, "total_return_pct"),
         max_drawdown_pct_realized=max_drawdown_metric,
@@ -515,7 +687,14 @@ def main() -> int:
 
         top_cols = [
             "run_id",
+            "prediction_source",
+            "predictions_table",
+            "resolved_prob_column",
+            "resolved_score_column",
             "ranking_mode",
+            "weight_6h",
+            "weight_24h",
+            "weight_72h",
             "prob_threshold",
             "take_profit_pct",
             "stop_loss_pct",

@@ -1,23 +1,38 @@
 #!/usr/bin/env python3
 """
-Train a baseline spike-prediction model from spike_training_rows.
+Train spike-prediction models from spike_training_rows.
 
-Phase 4 baseline:
-- target: label_spike_24h
-- time-aware split (no shuffle)
-- per-row sample weights optional
-- baseline model: LogisticRegression
-- optional second model: HistGradientBoostingClassifier
-- writes metrics + predictions to SQLite
+Phase 4.7 upgrades
+------------------
+- Supports multi-horizon targets:
+    - 6h
+    - 24h
+    - 72h
+- Can train one target or all supported horizons in one run
+- Preserves backward compatibility with legacy label columns
+- Writes horizon-aware metrics and predictions to SQLite
+- Uses time-aware split (no shuffle)
+- Supports LogisticRegression or HistGradientBoostingClassifier
 
-Example:
+Examples
+--------
+Train the 24h model only:
 ./.venv/bin/python scripts/train_spike_model.py \
   --db-path tradarbot.db \
   --input-table spike_training_rows \
-  --target-column label_spike_24h \
-  --metrics-table spike_model_metrics \
-  --predictions-table spike_model_predictions \
-  --model logistic
+  --target-column spike_24h_label \
+  --metrics-table spike_model_metrics_24h \
+  --predictions-table spike_model_predictions_24h \
+  --model hgb
+
+Train all horizons:
+./.venv/bin/python scripts/train_spike_model.py \
+  --db-path tradarbot.db \
+  --input-table spike_training_rows \
+  --train-all-horizons \
+  --metrics-table spike_model_metrics_multi \
+  --predictions-table-prefix spike_model_predictions \
+  --model hgb
 """
 
 from __future__ import annotations
@@ -26,8 +41,8 @@ import argparse
 import json
 import logging
 import sqlite3
-from dataclasses import dataclass
-from typing import List, Sequence
+from dataclasses import dataclass, asdict
+from typing import Sequence
 
 import numpy as np
 import pandas as pd
@@ -48,6 +63,7 @@ from sklearn.preprocessing import StandardScaler
 
 LOGGER = logging.getLogger("train_spike_model")
 
+SUPPORTED_HORIZONS = ("6h", "24h", "72h")
 
 DEFAULT_FEATURE_COLUMNS = [
     "ret_1h",
@@ -64,10 +80,23 @@ DEFAULT_FEATURE_COLUMNS = [
     "coverage_ratio_24h",
 ]
 
+DEFAULT_TARGET_COLUMN_BY_HORIZON = {
+    "6h": "spike_6h_label",
+    "24h": "spike_24h_label",
+    "72h": "spike_72h_label",
+}
+
+LEGACY_TARGET_COLUMN_BY_HORIZON = {
+    "6h": "label_spike_6h",
+    "24h": "label_spike_24h",
+    "72h": "label_spike_72h",
+}
+
 
 @dataclass
 class TrainResult:
     model_name: str
+    horizon: str
     target_column: str
     train_rows: int
     test_rows: int
@@ -80,14 +109,25 @@ class TrainResult:
     precision_at_best_f1: float | None
     recall_at_best_f1: float | None
     f1_at_best_f1: float | None
-    report_json: str
+    classification_report_json: str
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--db-path", required=True)
     parser.add_argument("--input-table", default="spike_training_rows")
-    parser.add_argument("--target-column", default="label_spike_24h")
+    parser.add_argument("--target-column", default=None)
+    parser.add_argument(
+        "--horizon",
+        choices=SUPPORTED_HORIZONS,
+        default="24h",
+        help="Target horizon to train when not using --train-all-horizons.",
+    )
+    parser.add_argument(
+        "--train-all-horizons",
+        action="store_true",
+        help="Train separate models for 6h, 24h, and 72h in one run.",
+    )
     parser.add_argument("--timestamp-column", default="timestamp")
     parser.add_argument("--symbol-column", default="symbol")
     parser.add_argument(
@@ -98,7 +138,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--train-fraction", type=float, default=0.80)
     parser.add_argument("--model", choices=["logistic", "hgb"], default="logistic")
     parser.add_argument("--metrics-table", default="spike_model_metrics")
-    parser.add_argument("--predictions-table", default="spike_model_predictions")
+    parser.add_argument(
+        "--predictions-table",
+        default="spike_model_predictions",
+        help="Used for single-target training.",
+    )
+    parser.add_argument(
+        "--predictions-table-prefix",
+        default="spike_model_predictions",
+        help="Used for --train-all-horizons. Outputs like spike_model_predictions_6h.",
+    )
     parser.add_argument("--if-exists", choices=["fail", "replace", "append"], default="replace")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     return parser.parse_args()
@@ -112,7 +161,7 @@ def configure_logging(level: str) -> None:
 
 
 def load_frame(conn: sqlite3.Connection, table: str) -> pd.DataFrame:
-    query = f"SELECT * FROM {table}"
+    query = f'SELECT * FROM "{table}"'
     return pd.read_sql_query(query, conn)
 
 
@@ -122,20 +171,44 @@ def validate_columns(df: pd.DataFrame, required: Sequence[str]) -> None:
         raise KeyError(f"Missing required columns: {missing}")
 
 
+def resolve_target_column(df: pd.DataFrame, *, horizon: str, explicit_target_column: str | None) -> str:
+    if explicit_target_column is not None:
+        if explicit_target_column not in df.columns:
+            raise KeyError(f"Explicit target column not found: {explicit_target_column}")
+        return explicit_target_column
+
+    preferred = DEFAULT_TARGET_COLUMN_BY_HORIZON[horizon]
+    legacy = LEGACY_TARGET_COLUMN_BY_HORIZON[horizon]
+
+    if preferred in df.columns:
+        return preferred
+    if legacy in df.columns:
+        return legacy
+
+    raise KeyError(
+        f"No target column found for horizon={horizon}. "
+        f"Tried {preferred!r} and {legacy!r}."
+    )
+
+
 def prepare_frame(
     df: pd.DataFrame,
     feature_columns: Sequence[str],
     target_column: str,
     timestamp_column: str,
+    symbol_column: str,
 ) -> pd.DataFrame:
-    validate_columns(df, list(feature_columns) + [target_column, timestamp_column])
+    validate_columns(df, list(feature_columns) + [target_column, timestamp_column, symbol_column])
 
     out = df.copy()
     out[timestamp_column] = pd.to_datetime(out[timestamp_column], utc=True, errors="raise")
-    out = out.sort_values(["symbol", timestamp_column]).reset_index(drop=True)
+    out = out.sort_values([symbol_column, timestamp_column]).reset_index(drop=True)
 
-    # Only keep rows with an actual binary label.
+    # Keep only rows with an actual binary label.
     out = out[out[target_column].isin([0, 1])].copy()
+
+    if out.empty:
+        raise ValueError(f"No rows remain after filtering to binary target values for {target_column}")
 
     return out
 
@@ -215,7 +288,9 @@ def choose_best_f1_threshold(y_true: np.ndarray, y_prob: np.ndarray) -> tuple[fl
 
 
 def evaluate(
+    *,
     model_name: str,
+    horizon: str,
     target_column: str,
     y_train: np.ndarray,
     y_test: np.ndarray,
@@ -227,11 +302,11 @@ def evaluate(
 
     best_threshold, best_precision, best_recall, best_f1 = choose_best_f1_threshold(y_test, y_prob)
     y_pred = (y_prob >= best_threshold).astype(int)
-
     report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
 
     return TrainResult(
         model_name=model_name,
+        horizon=horizon,
         target_column=target_column,
         train_rows=int(len(y_train)),
         test_rows=int(len(y_test)),
@@ -244,12 +319,119 @@ def evaluate(
         precision_at_best_f1=float(best_precision),
         recall_at_best_f1=float(best_recall),
         f1_at_best_f1=float(best_f1),
-        report_json=json.dumps(report),
+        classification_report_json=json.dumps(report),
     )
 
 
+def build_predictions_frame(
+    *,
+    test_df: pd.DataFrame,
+    symbol_column: str,
+    timestamp_column: str,
+    target_column: str,
+    y_prob: np.ndarray,
+    result: TrainResult,
+) -> pd.DataFrame:
+    out = test_df[[symbol_column, timestamp_column, target_column]].copy()
+    out["pred_prob"] = y_prob
+    out["pred_label_at_best_f1"] = (y_prob >= result.best_threshold_f1).astype(int)
+    out["model_name"] = result.model_name
+    out["horizon"] = result.horizon
+    out["target_column"] = result.target_column
+    return out
+
+
 def write_table(conn: sqlite3.Connection, df: pd.DataFrame, table: str, if_exists: str) -> None:
-    df.to_sql(table, conn, if_exists=if_exists, index=False)
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            out[col] = out[col].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    out.to_sql(table, conn, if_exists=if_exists, index=False)
+
+
+def train_one_horizon(
+    *,
+    df: pd.DataFrame,
+    horizon: str,
+    explicit_target_column: str | None,
+    feature_columns: Sequence[str],
+    timestamp_column: str,
+    symbol_column: str,
+    train_fraction: float,
+    model_name: str,
+) -> tuple[TrainResult, pd.DataFrame]:
+    target_column = resolve_target_column(
+        df,
+        horizon=horizon,
+        explicit_target_column=explicit_target_column,
+    )
+
+    prepared = prepare_frame(
+        df=df,
+        feature_columns=feature_columns,
+        target_column=target_column,
+        timestamp_column=timestamp_column,
+        symbol_column=symbol_column,
+    )
+    LOGGER.info(
+        "Prepared %d rows for horizon=%s target=%s",
+        len(prepared),
+        horizon,
+        target_column,
+    )
+
+    train_df, test_df = time_split(prepared, train_fraction)
+    LOGGER.info(
+        "Time split complete for horizon=%s: train=%d test=%d",
+        horizon,
+        len(train_df),
+        len(test_df),
+    )
+
+    X_train = train_df[list(feature_columns)]
+    y_train = train_df[target_column].astype(int).to_numpy()
+    X_test = test_df[list(feature_columns)]
+    y_test = test_df[target_column].astype(int).to_numpy()
+
+    model = build_model(model_name, feature_columns)
+    LOGGER.info("Training model=%s horizon=%s", model_name, horizon)
+    model.fit(X_train, y_train)
+
+    if hasattr(model, "predict_proba"):
+        y_prob = model.predict_proba(X_test)[:, 1]
+    else:
+        y_prob = model.predict(X_test)
+
+    result = evaluate(
+        model_name=model_name,
+        horizon=horizon,
+        target_column=target_column,
+        y_train=y_train,
+        y_test=y_test,
+        y_prob=y_prob,
+    )
+
+    LOGGER.info(
+        "Metrics horizon=%s: roc_auc=%s pr_auc=%s brier=%s best_threshold=%s f1=%s precision=%s recall=%s",
+        horizon,
+        result.roc_auc,
+        result.pr_auc,
+        result.brier_score,
+        result.best_threshold_f1,
+        result.f1_at_best_f1,
+        result.precision_at_best_f1,
+        result.recall_at_best_f1,
+    )
+
+    predictions_df = build_predictions_frame(
+        test_df=test_df,
+        symbol_column=symbol_column,
+        timestamp_column=timestamp_column,
+        target_column=target_column,
+        y_prob=y_prob,
+        result=result,
+    )
+    return result, predictions_df
 
 
 def main() -> int:
@@ -262,79 +444,54 @@ def main() -> int:
         df = load_frame(conn, args.input_table)
         LOGGER.info("Loaded %d rows from %s", len(df), args.input_table)
 
-        prepared = prepare_frame(
-            df=df,
-            feature_columns=args.feature_columns,
-            target_column=args.target_column,
-            timestamp_column=args.timestamp_column,
-        )
-        LOGGER.info("Prepared %d rows with target=%s", len(prepared), args.target_column)
+        if args.train_all_horizons:
+            metrics_rows: list[dict[str, object]] = []
 
-        train_df, test_df = time_split(prepared, args.train_fraction)
-        LOGGER.info("Time split complete: train=%d test=%d", len(train_df), len(test_df))
+            for idx, horizon in enumerate(SUPPORTED_HORIZONS):
+                result, predictions_df = train_one_horizon(
+                    df=df,
+                    horizon=horizon,
+                    explicit_target_column=None,
+                    feature_columns=args.feature_columns,
+                    timestamp_column=args.timestamp_column,
+                    symbol_column=args.symbol_column,
+                    train_fraction=args.train_fraction,
+                    model_name=args.model,
+                )
 
-        X_train = train_df[list(args.feature_columns)]
-        y_train = train_df[args.target_column].astype(int).to_numpy()
-        X_test = test_df[list(args.feature_columns)]
-        y_test = test_df[args.target_column].astype(int).to_numpy()
+                metrics_rows.append(asdict(result))
+                predictions_table = f"{args.predictions_table_prefix}_{horizon}"
 
-        model = build_model(args.model, args.feature_columns)
-        LOGGER.info("Training model=%s", args.model)
-        model.fit(X_train, y_train)
+                write_mode = args.if_exists if idx == 0 else "replace"
+                write_table(conn, predictions_df, predictions_table, write_mode)
+                LOGGER.info("Wrote predictions for horizon=%s -> %s", horizon, predictions_table)
 
-        y_prob = model.predict_proba(X_test)[:, 1] if hasattr(model, "predict_proba") else model.predict(X_test)
-        result = evaluate(
-            model_name=args.model,
-            target_column=args.target_column,
-            y_train=y_train,
-            y_test=y_test,
-            y_prob=y_prob,
-        )
+            metrics_df = pd.DataFrame(metrics_rows)
+            write_table(conn, metrics_df, args.metrics_table, args.if_exists)
+            LOGGER.info("Wrote multi-horizon metrics -> %s", args.metrics_table)
 
-        LOGGER.info(
-            "Metrics: roc_auc=%s pr_auc=%s brier=%s best_threshold=%s f1=%s precision=%s recall=%s",
-            result.roc_auc,
-            result.pr_auc,
-            result.brier_score,
-            result.best_threshold_f1,
-            result.f1_at_best_f1,
-            result.precision_at_best_f1,
-            result.recall_at_best_f1,
-        )
+        else:
+            horizon = args.horizon
+            result, predictions_df = train_one_horizon(
+                df=df,
+                horizon=horizon,
+                explicit_target_column=args.target_column,
+                feature_columns=args.feature_columns,
+                timestamp_column=args.timestamp_column,
+                symbol_column=args.symbol_column,
+                train_fraction=args.train_fraction,
+                model_name=args.model,
+            )
 
-        metrics_df = pd.DataFrame(
-            [
-                {
-                    "model_name": result.model_name,
-                    "target_column": result.target_column,
-                    "train_rows": result.train_rows,
-                    "test_rows": result.test_rows,
-                    "positive_rate_train": result.positive_rate_train,
-                    "positive_rate_test": result.positive_rate_test,
-                    "roc_auc": result.roc_auc,
-                    "pr_auc": result.pr_auc,
-                    "brier_score": result.brier_score,
-                    "best_threshold_f1": result.best_threshold_f1,
-                    "precision_at_best_f1": result.precision_at_best_f1,
-                    "recall_at_best_f1": result.recall_at_best_f1,
-                    "f1_at_best_f1": result.f1_at_best_f1,
-                    "classification_report_json": result.report_json,
-                }
-            ]
-        )
+            metrics_df = pd.DataFrame([asdict(result)])
 
-        predictions_df = test_df[[args.symbol_column, args.timestamp_column, args.target_column]].copy()
-        predictions_df["pred_prob"] = y_prob
-        predictions_df["pred_label_at_best_f1"] = (y_prob >= result.best_threshold_f1).astype(int)
-        predictions_df["model_name"] = args.model
-
-        write_table(conn, metrics_df, args.metrics_table, args.if_exists)
-        write_table(conn, predictions_df, args.predictions_table, args.if_exists)
-        LOGGER.info(
-            "Wrote metrics -> %s and predictions -> %s",
-            args.metrics_table,
-            args.predictions_table,
-        )
+            write_table(conn, metrics_df, args.metrics_table, args.if_exists)
+            write_table(conn, predictions_df, args.predictions_table, args.if_exists)
+            LOGGER.info(
+                "Wrote metrics -> %s and predictions -> %s",
+                args.metrics_table,
+                args.predictions_table,
+            )
 
     finally:
         conn.close()
