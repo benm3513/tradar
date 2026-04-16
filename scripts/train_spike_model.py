@@ -2,7 +2,7 @@
 """
 Train spike-prediction models from spike_training_rows.
 
-Phase 4.7 upgrades
+Phase 4.8 upgrades
 ------------------
 - Supports multi-horizon targets:
     - 6h
@@ -13,6 +13,19 @@ Phase 4.7 upgrades
 - Writes horizon-aware metrics and predictions to SQLite
 - Uses time-aware split (no shuffle)
 - Supports LogisticRegression or HistGradientBoostingClassifier
+- Adds signal-quality feature set:
+    - momentum acceleration
+    - volume spikes vs baseline
+    - cross-asset relative strength / correlation
+    - regime detection
+- Adds safeguards:
+    - replace inf/-inf with NaN
+    - drop rows missing required features/target before training
+    - optional low-variance feature filtering
+- Adds feature-importance outputs:
+    - impurity-based importances for HGB
+    - per-horizon SQLite tables
+    - top-feature logging
 
 Examples
 --------
@@ -48,7 +61,9 @@ import numpy as np
 import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import HistGradientBoostingClassifier
+from sklearn.feature_selection import VarianceThreshold
 from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
@@ -66,18 +81,56 @@ LOGGER = logging.getLogger("train_spike_model")
 SUPPORTED_HORIZONS = ("6h", "24h", "72h")
 
 DEFAULT_FEATURE_COLUMNS = [
+    # Core returns
     "ret_1h",
     "ret_6h",
     "ret_24h",
+
+    # Volatility / range
     "rolling_volatility_24h",
     "range_pct_24h",
+
+    # Volume baseline features
     "volume_ratio_1h_vs_24h_avg",
     "volume_ratio_current_vs_24h_avg",
+
+    # Price structure
     "drawup_from_recent_low_24h",
+
+    # Data quality / timing
     "hours_since_prev_row",
     "rows_in_last_24h",
     "coverage_hours_24h",
     "coverage_ratio_24h",
+
+    # Momentum acceleration
+    "momentum_accel_1h_vs_6h",
+    "momentum_accel_6h_vs_24h",
+
+    # Z-score normalization
+    "price_zscore_24h",
+    "volume_zscore_24h",
+
+    # Volume spike detection
+    "volume_spike_ratio_24h",
+    "volume_spike_ratio_7d",
+
+    # Cross-asset relative strength
+    "relative_strength_1h",
+    "relative_strength_24h",
+
+    # Market correlation / beta
+    "corr_to_market_24h",
+    "beta_to_market_24h",
+
+    # Market regime features
+    "market_breadth_up_1h",
+    "market_breadth_up_24h",
+    "market_dispersion_1h",
+    "market_dispersion_24h",
+    "market_trend_strength_24h",
+    "market_volume_regime_24h",
+    "market_risk_off_score",
 ]
 
 DEFAULT_TARGET_COLUMN_BY_HORIZON = {
@@ -100,6 +153,8 @@ class TrainResult:
     target_column: str
     train_rows: int
     test_rows: int
+    feature_count_requested: int
+    feature_count_used: int
     positive_rate_train: float
     positive_rate_test: float
     roc_auc: float | None
@@ -147,6 +202,56 @@ def parse_args() -> argparse.Namespace:
         "--predictions-table-prefix",
         default="spike_model_predictions",
         help="Used for --train-all-horizons. Outputs like spike_model_predictions_6h.",
+    )
+    parser.add_argument(
+        "--drop-rows-with-missing-features",
+        action="store_true",
+        default=True,
+        help="Drop rows with missing requested features before training. Default: enabled.",
+    )
+    parser.add_argument(
+        "--no-drop-rows-with-missing-features",
+        action="store_false",
+        dest="drop_rows_with_missing_features",
+        help="Do not drop rows with missing features before training; rely on imputation instead.",
+    )
+    parser.add_argument(
+        "--enable-variance-threshold",
+        action="store_true",
+        help="Enable low-variance feature filtering before model training.",
+    )
+    parser.add_argument(
+        "--variance-threshold",
+        type=float,
+        default=1e-6,
+        help="Threshold used by sklearn VarianceThreshold when enabled.",
+    )
+    parser.add_argument(
+        "--feature-importance-table-prefix",
+        default="spike_feature_importance",
+        help="Prefix for per-horizon feature importance tables.",
+    )
+    parser.add_argument(
+        "--top-feature-count",
+        type=int,
+        default=10,
+        help="How many top features to log.",
+    )
+    parser.add_argument(
+        "--enable-permutation-importance",
+        action="store_true",
+        help="Also compute permutation importance on the test split for the trained model.",
+    )
+    parser.add_argument(
+        "--permutation-importance-table-prefix",
+        default="spike_permutation_importance",
+        help="Prefix for per-horizon permutation-importance tables.",
+    )
+    parser.add_argument(
+        "--permutation-repeats",
+        type=int,
+        default=5,
+        help="Number of repeats for permutation importance.",
     )
     parser.add_argument("--if-exists", choices=["fail", "replace", "append"], default="replace")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
@@ -197,18 +302,31 @@ def prepare_frame(
     target_column: str,
     timestamp_column: str,
     symbol_column: str,
+    *,
+    drop_rows_with_missing_features: bool,
 ) -> pd.DataFrame:
     validate_columns(df, list(feature_columns) + [target_column, timestamp_column, symbol_column])
 
     out = df.copy()
+    out = out.replace([np.inf, -np.inf], np.nan)
     out[timestamp_column] = pd.to_datetime(out[timestamp_column], utc=True, errors="raise")
     out = out.sort_values([symbol_column, timestamp_column]).reset_index(drop=True)
 
-    # Keep only rows with an actual binary label.
     out = out[out[target_column].isin([0, 1])].copy()
 
+    if drop_rows_with_missing_features:
+        before = len(out)
+        out = out.dropna(subset=list(feature_columns) + [target_column]).copy()
+        dropped = before - len(out)
+        if dropped > 0:
+            LOGGER.info(
+                "Dropped %d rows with missing required features/target for %s",
+                dropped,
+                target_column,
+            )
+
     if out.empty:
-        raise ValueError(f"No rows remain after filtering to binary target values for {target_column}")
+        raise ValueError(f"No rows remain after filtering/cleaning for {target_column}")
 
     return out
 
@@ -224,13 +342,22 @@ def time_split(df: pd.DataFrame, train_fraction: float) -> tuple[pd.DataFrame, p
     return train_df, test_df
 
 
-def build_model(model_name: str, numeric_features: Sequence[str]) -> Pipeline:
-    numeric_preproc = Pipeline(
-        steps=[
-            ("imputer", SimpleImputer(strategy="median")),
-            ("scaler", StandardScaler()),
-        ]
-    )
+def build_model(
+    model_name: str,
+    numeric_features: Sequence[str],
+    *,
+    enable_variance_threshold: bool,
+    variance_threshold: float,
+) -> Pipeline:
+    numeric_steps = [
+        ("imputer", SimpleImputer(strategy="median")),
+    ]
+
+    if enable_variance_threshold:
+        numeric_steps.append(("variance_filter", VarianceThreshold(threshold=variance_threshold)))
+
+    numeric_steps.append(("scaler", StandardScaler()))
+    numeric_preproc = Pipeline(steps=numeric_steps)
 
     preprocessor = ColumnTransformer(
         transformers=[("num", numeric_preproc, list(numeric_features))],
@@ -292,6 +419,8 @@ def evaluate(
     model_name: str,
     horizon: str,
     target_column: str,
+    feature_count_requested: int,
+    feature_count_used: int,
     y_train: np.ndarray,
     y_test: np.ndarray,
     y_prob: np.ndarray,
@@ -310,6 +439,8 @@ def evaluate(
         target_column=target_column,
         train_rows=int(len(y_train)),
         test_rows=int(len(y_test)),
+        feature_count_requested=int(feature_count_requested),
+        feature_count_used=int(feature_count_used),
         positive_rate_train=float(np.mean(y_train)),
         positive_rate_test=float(np.mean(y_test)),
         roc_auc=float(roc_auc) if roc_auc is not None else None,
@@ -349,8 +480,106 @@ def write_table(conn: sqlite3.Connection, df: pd.DataFrame, table: str, if_exist
     out.to_sql(table, conn, if_exists=if_exists, index=False)
 
 
+def _estimate_feature_count_used(model: Pipeline, requested_feature_count: int) -> int:
+    try:
+        preprocessor = model.named_steps["preprocessor"]
+        transformed = preprocessor.transformers_[0][1]
+        if "variance_filter" in transformed.named_steps:
+            selector = transformed.named_steps["variance_filter"]
+            return int(selector.get_support().sum())
+    except Exception:
+        pass
+    return int(requested_feature_count)
+
+
+def _extract_post_variance_feature_names(
+    model: Pipeline,
+    feature_columns: Sequence[str],
+) -> list[str]:
+    feature_names = list(feature_columns)
+    try:
+        preprocessor = model.named_steps["preprocessor"]
+        numeric_pipeline = preprocessor.transformers_[0][1]
+        if "variance_filter" in numeric_pipeline.named_steps:
+            selector = numeric_pipeline.named_steps["variance_filter"]
+            mask = selector.get_support()
+            feature_names = [name for name, keep in zip(feature_columns, mask) if keep]
+    except Exception:
+        pass
+    return feature_names
+
+
+def build_feature_importance_frame(
+    *,
+    model: Pipeline,
+    feature_columns: Sequence[str],
+    horizon: str,
+    target_column: str,
+) -> pd.DataFrame:
+    estimator = model.named_steps["model"]
+    if not hasattr(estimator, "feature_importances_"):
+        return pd.DataFrame(
+            columns=["feature", "importance", "horizon", "target_column", "importance_type", "rank"]
+        )
+
+    feature_names = _extract_post_variance_feature_names(model, feature_columns)
+    importances = np.asarray(estimator.feature_importances_, dtype=float)
+
+    if len(feature_names) != len(importances):
+        min_len = min(len(feature_names), len(importances))
+        feature_names = feature_names[:min_len]
+        importances = importances[:min_len]
+
+    fi_df = pd.DataFrame(
+        {
+            "feature": feature_names,
+            "importance": importances,
+        }
+    ).sort_values("importance", ascending=False, kind="stable").reset_index(drop=True)
+
+    fi_df["horizon"] = horizon
+    fi_df["target_column"] = target_column
+    fi_df["importance_type"] = "model_feature_importance"
+    fi_df["rank"] = np.arange(1, len(fi_df) + 1)
+    return fi_df
+
+
+def build_permutation_importance_frame(
+    *,
+    model: Pipeline,
+    X_test: pd.DataFrame,
+    y_test: np.ndarray,
+    feature_columns: Sequence[str],
+    horizon: str,
+    target_column: str,
+    n_repeats: int,
+) -> pd.DataFrame:
+    result = permutation_importance(
+        model,
+        X_test,
+        y_test,
+        n_repeats=n_repeats,
+        random_state=42,
+        scoring="average_precision",
+    )
+    pi_df = pd.DataFrame(
+        {
+            "feature": list(feature_columns),
+            "importance_mean": result.importances_mean,
+            "importance_std": result.importances_std,
+        }
+    ).sort_values("importance_mean", ascending=False, kind="stable").reset_index(drop=True)
+
+    pi_df["horizon"] = horizon
+    pi_df["target_column"] = target_column
+    pi_df["importance_type"] = "permutation_average_precision"
+    pi_df["rank"] = np.arange(1, len(pi_df) + 1)
+    return pi_df
+
+
 def train_one_horizon(
     *,
+    conn: sqlite3.Connection,
     df: pd.DataFrame,
     horizon: str,
     explicit_target_column: str | None,
@@ -359,6 +588,14 @@ def train_one_horizon(
     symbol_column: str,
     train_fraction: float,
     model_name: str,
+    drop_rows_with_missing_features: bool,
+    enable_variance_threshold: bool,
+    variance_threshold: float,
+    feature_importance_table_prefix: str,
+    top_feature_count: int,
+    enable_permutation_importance: bool,
+    permutation_importance_table_prefix: str,
+    permutation_repeats: int,
 ) -> tuple[TrainResult, pd.DataFrame]:
     target_column = resolve_target_column(
         df,
@@ -372,6 +609,7 @@ def train_one_horizon(
         target_column=target_column,
         timestamp_column=timestamp_column,
         symbol_column=symbol_column,
+        drop_rows_with_missing_features=drop_rows_with_missing_features,
     )
     LOGGER.info(
         "Prepared %d rows for horizon=%s target=%s",
@@ -393,7 +631,12 @@ def train_one_horizon(
     X_test = test_df[list(feature_columns)]
     y_test = test_df[target_column].astype(int).to_numpy()
 
-    model = build_model(model_name, feature_columns)
+    model = build_model(
+        model_name,
+        feature_columns,
+        enable_variance_threshold=enable_variance_threshold,
+        variance_threshold=variance_threshold,
+    )
     LOGGER.info("Training model=%s horizon=%s", model_name, horizon)
     model.fit(X_train, y_train)
 
@@ -402,17 +645,21 @@ def train_one_horizon(
     else:
         y_prob = model.predict(X_test)
 
+    feature_count_used = _estimate_feature_count_used(model, len(feature_columns))
+
     result = evaluate(
         model_name=model_name,
         horizon=horizon,
         target_column=target_column,
+        feature_count_requested=len(feature_columns),
+        feature_count_used=feature_count_used,
         y_train=y_train,
         y_test=y_test,
         y_prob=y_prob,
     )
 
     LOGGER.info(
-        "Metrics horizon=%s: roc_auc=%s pr_auc=%s brier=%s best_threshold=%s f1=%s precision=%s recall=%s",
+        "Metrics horizon=%s: roc_auc=%s pr_auc=%s brier=%s best_threshold=%s f1=%s precision=%s recall=%s features=%d/%d",
         horizon,
         result.roc_auc,
         result.pr_auc,
@@ -421,7 +668,44 @@ def train_one_horizon(
         result.f1_at_best_f1,
         result.precision_at_best_f1,
         result.recall_at_best_f1,
+        result.feature_count_used,
+        result.feature_count_requested,
     )
+
+    if model_name == "hgb":
+        fi_df = build_feature_importance_frame(
+            model=model,
+            feature_columns=feature_columns,
+            horizon=horizon,
+            target_column=target_column,
+        )
+        fi_table = f"{feature_importance_table_prefix}_{horizon}"
+        write_table(conn, fi_df, fi_table, "replace")
+        LOGGER.info(
+            "Top %d features (%s):\n%s",
+            top_feature_count,
+            horizon,
+            fi_df.head(top_feature_count).to_string(index=False),
+        )
+
+        if enable_permutation_importance:
+            pi_df = build_permutation_importance_frame(
+                model=model,
+                X_test=X_test,
+                y_test=y_test,
+                feature_columns=feature_columns,
+                horizon=horizon,
+                target_column=target_column,
+                n_repeats=permutation_repeats,
+            )
+            pi_table = f"{permutation_importance_table_prefix}_{horizon}"
+            write_table(conn, pi_df, pi_table, "replace")
+            LOGGER.info(
+                "Top %d permutation features (%s):\n%s",
+                top_feature_count,
+                horizon,
+                pi_df.head(top_feature_count).to_string(index=False),
+            )
 
     predictions_df = build_predictions_frame(
         test_df=test_df,
@@ -449,6 +733,7 @@ def main() -> int:
 
             for idx, horizon in enumerate(SUPPORTED_HORIZONS):
                 result, predictions_df = train_one_horizon(
+                    conn=conn,
                     df=df,
                     horizon=horizon,
                     explicit_target_column=None,
@@ -457,6 +742,14 @@ def main() -> int:
                     symbol_column=args.symbol_column,
                     train_fraction=args.train_fraction,
                     model_name=args.model,
+                    drop_rows_with_missing_features=args.drop_rows_with_missing_features,
+                    enable_variance_threshold=args.enable_variance_threshold,
+                    variance_threshold=args.variance_threshold,
+                    feature_importance_table_prefix=args.feature_importance_table_prefix,
+                    top_feature_count=args.top_feature_count,
+                    enable_permutation_importance=args.enable_permutation_importance,
+                    permutation_importance_table_prefix=args.permutation_importance_table_prefix,
+                    permutation_repeats=args.permutation_repeats,
                 )
 
                 metrics_rows.append(asdict(result))
@@ -473,6 +766,7 @@ def main() -> int:
         else:
             horizon = args.horizon
             result, predictions_df = train_one_horizon(
+                conn=conn,
                 df=df,
                 horizon=horizon,
                 explicit_target_column=args.target_column,
@@ -481,6 +775,14 @@ def main() -> int:
                 symbol_column=args.symbol_column,
                 train_fraction=args.train_fraction,
                 model_name=args.model,
+                drop_rows_with_missing_features=args.drop_rows_with_missing_features,
+                enable_variance_threshold=args.enable_variance_threshold,
+                variance_threshold=args.variance_threshold,
+                feature_importance_table_prefix=args.feature_importance_table_prefix,
+                top_feature_count=args.top_feature_count,
+                enable_permutation_importance=args.enable_permutation_importance,
+                permutation_importance_table_prefix=args.permutation_importance_table_prefix,
+                permutation_repeats=args.permutation_repeats,
             )
 
             metrics_df = pd.DataFrame([asdict(result)])

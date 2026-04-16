@@ -5,18 +5,22 @@ This script computes backward-looking market features from the base research
 rows and optionally merges them with the labeled dataset to produce a single
 feature table suitable for downstream inspection and training export.
 
-Phase 4.7 upgrades
-------------------
-- Preserves strict no-leakage, backward-looking feature computation
-- Merges cleanly with upgraded multi-horizon label outputs
-- Supports stable alias labels:
-    - spike_6h_label
-    - spike_24h_label
-    - spike_72h_label
-    - tradeable_pre_spike_6h_label
-    - ...
-- Adds multi-horizon join diagnostics
-- Produces summary metrics for label coverage by horizon
+Signal-quality upgrades
+-----------------------
+Adds four new feature families:
+- momentum acceleration
+- volume spikes vs baseline
+- cross-asset correlation / relative strength
+- regime detection
+
+Design goals
+------------
+- No trading-engine changes
+- Strictly no future leakage
+- Per-symbol computation only for asset-level features
+- Cross-asset features computed only from same-timestamp or prior information
+- Time-aware windows instead of row-count assumptions
+- SQLite -> pandas -> SQLite flow
 
 Typical usage
 -------------
@@ -24,7 +28,8 @@ python scripts/build_spike_features.py \
     --db-path tradarbot.db \
     --base-table spike_base_rows \
     --label-table spike_labeled_rows \
-    --output-table spike_feature_rows
+    --output-table spike_feature_rows \
+    --summary-table spike_feature_summary
 """
 
 from __future__ import annotations
@@ -65,6 +70,29 @@ FEATURE_COLUMNS = [
     "rows_in_last_24h",
     "coverage_hours_24h",
     "coverage_ratio_24h",
+    # momentum acceleration
+    "momentum_accel_1h_vs_6h",
+    "momentum_accel_6h_vs_24h",
+    "price_zscore_24h",
+    # volume spikes vs baseline
+    "volume_zscore_24h",
+    "volume_spike_ratio_24h",
+    "volume_spike_ratio_7d",
+    # cross-asset relative / correlation
+    "market_ret_1h_ex_self",
+    "market_ret_24h_ex_self",
+    "relative_strength_1h",
+    "relative_strength_24h",
+    "corr_to_market_24h",
+    "beta_to_market_24h",
+    # regime detection
+    "market_breadth_up_1h",
+    "market_breadth_up_24h",
+    "market_dispersion_1h",
+    "market_dispersion_24h",
+    "market_trend_strength_24h",
+    "market_volume_regime_24h",
+    "market_risk_off_score",
 ]
 
 QUALITY_FLAG_COLUMNS = [
@@ -252,6 +280,14 @@ def _safe_divide(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
     return result.replace([np.inf, -np.inf], np.nan)
 
 
+def _safe_group_zscore_series(series: pd.Series) -> pd.Series:
+    numeric = pd.to_numeric(series, errors="coerce")
+    std = numeric.std(ddof=0)
+    if pd.isna(std) or std <= 1e-12:
+        return pd.Series(0.0, index=series.index, dtype=float)
+    return ((numeric - numeric.mean()) / std).fillna(0.0)
+
+
 def _compute_time_aware_returns(
     asset_frame: pd.DataFrame,
     *,
@@ -280,6 +316,55 @@ def _compute_time_aware_returns(
     return _safe_divide(current_price, historical_price) - 1.0
 
 
+def _compute_rolling_corr_beta(
+    asset_df: pd.DataFrame,
+    *,
+    timestamp_column: str,
+    asset_return_column: str,
+    market_return_column: str,
+    window: int = 24,
+    min_periods: int = 12,
+) -> pd.DataFrame:
+    out = asset_df.sort_values(timestamp_column).copy()
+    x = pd.to_numeric(out[asset_return_column], errors="coerce")
+    y = pd.to_numeric(out[market_return_column], errors="coerce")
+
+    corr_values: list[float] = []
+    beta_values: list[float] = []
+
+    for idx in range(len(out)):
+        start = max(0, idx - window + 1)
+        xw = x.iloc[start: idx + 1]
+        yw = y.iloc[start: idx + 1]
+
+        valid = xw.notna() & yw.notna()
+        if int(valid.sum()) < min_periods:
+            corr_values.append(np.nan)
+            beta_values.append(np.nan)
+            continue
+
+        xwv = xw[valid].astype(float)
+        ywv = yw[valid].astype(float)
+
+        x_std = float(xwv.std(ddof=0))
+        y_std = float(ywv.std(ddof=0))
+        if x_std <= 1e-12 or y_std <= 1e-12:
+            corr_values.append(0.0)
+        else:
+            corr_values.append(float(xwv.corr(ywv)))
+
+        market_var = float(ywv.var(ddof=0))
+        if market_var <= 1e-12:
+            beta_values.append(0.0)
+        else:
+            cov = float(((xwv - xwv.mean()) * (ywv - ywv.mean())).mean())
+            beta_values.append(cov / market_var)
+
+    out["corr_to_market_24h"] = corr_values
+    out["beta_to_market_24h"] = beta_values
+    return out
+
+
 def build_features_for_asset(
     asset_frame: pd.DataFrame,
     *,
@@ -288,6 +373,7 @@ def build_features_for_asset(
 ) -> pd.DataFrame:
     asset_frame = asset_frame.sort_values(timestamp_column).reset_index(drop=True).copy()
 
+    # Time-aware lagged returns.
     asset_frame["ret_1h"] = _compute_time_aware_returns(
         asset_frame,
         timestamp_column=timestamp_column,
@@ -326,8 +412,11 @@ def build_features_for_asset(
     current_volume = indexed["volume_base"].astype(float)
     trailing_vol_1h = current_volume.rolling("1h", min_periods=1).sum()
     trailing_vol_24h = current_volume.rolling(trailing_window, min_periods=1).sum()
+    trailing_vol_7d = current_volume.rolling("168h", min_periods=24).sum()
     trailing_avg_hourly_vol_24h = trailing_vol_24h / 24.0
+    trailing_avg_hourly_vol_7d = trailing_vol_7d / 168.0
     trailing_mean_bar_vol_24h = current_volume.rolling(trailing_window, min_periods=1).mean()
+    trailing_std_bar_vol_24h = current_volume.rolling(trailing_window, min_periods=6).std()
 
     asset_frame["volume_ratio_1h_vs_24h_avg"] = _safe_divide(
         trailing_vol_1h, trailing_avg_hourly_vol_24h
@@ -376,7 +465,120 @@ def build_features_for_asset(
         | (asset_frame["coverage_ratio_24h"] < 0.5)
     ).fillna(asset_frame["coverage_ratio_24h"] < 0.5).astype(int)
 
+    # Signal-quality upgrades
+
+    # 1) Momentum acceleration
+    asset_frame["momentum_accel_1h_vs_6h"] = (
+        asset_frame["ret_1h"] - (asset_frame["ret_6h"] / 6.0)
+    )
+    asset_frame["momentum_accel_6h_vs_24h"] = (
+        asset_frame["ret_6h"] - (asset_frame["ret_24h"] / 4.0)
+    )
+    rolling_mean_close_24h = current_close.rolling("24h", min_periods=6).mean()
+    rolling_std_close_24h = current_close.rolling("24h", min_periods=6).std()
+    asset_frame["price_zscore_24h"] = _safe_divide(
+        current_close - rolling_mean_close_24h,
+        rolling_std_close_24h,
+    ).to_numpy()
+
+    # 2) Volume spikes vs baseline
+    asset_frame["volume_zscore_24h"] = _safe_divide(
+        current_volume - trailing_mean_bar_vol_24h,
+        trailing_std_bar_vol_24h,
+    ).to_numpy()
+    asset_frame["volume_spike_ratio_24h"] = _safe_divide(
+        current_volume,
+        trailing_mean_bar_vol_24h,
+    ).to_numpy()
+    asset_frame["volume_spike_ratio_7d"] = _safe_divide(
+        trailing_vol_1h,
+        trailing_avg_hourly_vol_7d,
+    ).to_numpy()
+
     return asset_frame.reset_index(drop=True)
+
+
+def add_cross_asset_and_regime_features(
+    feature_frame: pd.DataFrame,
+    *,
+    timestamp_column: str,
+    symbol_column: str,
+) -> pd.DataFrame:
+    out = feature_frame.copy()
+
+    required = [timestamp_column, symbol_column, "ret_1h", "ret_24h", "volume_ratio_1h_vs_24h_avg"]
+    missing = [col for col in required if col not in out.columns]
+    if missing:
+        raise BuildSpikeFeaturesError(f"feature frame missing columns for regime/correlation features: {missing}")
+
+    # Cross-sectional market aggregates at each timestamp
+    grouped = out.groupby(timestamp_column, dropna=False)
+
+    out["market_mean_ret_1h"] = grouped["ret_1h"].transform("mean")
+    out["market_mean_ret_24h"] = grouped["ret_24h"].transform("mean")
+    out["market_sum_ret_1h"] = grouped["ret_1h"].transform("sum")
+    out["market_sum_ret_24h"] = grouped["ret_24h"].transform("sum")
+    out["market_asset_count"] = grouped[symbol_column].transform("count").astype(float)
+
+    denom = (out["market_asset_count"] - 1.0).replace(0.0, np.nan)
+    out["market_ret_1h_ex_self"] = _safe_divide(
+        out["market_sum_ret_1h"] - pd.to_numeric(out["ret_1h"], errors="coerce"),
+        denom,
+    )
+    out["market_ret_24h_ex_self"] = _safe_divide(
+        out["market_sum_ret_24h"] - pd.to_numeric(out["ret_24h"], errors="coerce"),
+        denom,
+    )
+
+    out["relative_strength_1h"] = (
+        pd.to_numeric(out["ret_1h"], errors="coerce")
+        - pd.to_numeric(out["market_ret_1h_ex_self"], errors="coerce")
+    )
+    out["relative_strength_24h"] = (
+        pd.to_numeric(out["ret_24h"], errors="coerce")
+        - pd.to_numeric(out["market_ret_24h_ex_self"], errors="coerce")
+    )
+
+    out["market_breadth_up_1h"] = grouped["ret_1h"].transform(
+        lambda s: pd.to_numeric(s, errors="coerce").gt(0).mean()
+    )
+    out["market_breadth_up_24h"] = grouped["ret_24h"].transform(
+        lambda s: pd.to_numeric(s, errors="coerce").gt(0).mean()
+    )
+    out["market_dispersion_1h"] = grouped["ret_1h"].transform(
+        lambda s: pd.to_numeric(s, errors="coerce").std(ddof=0)
+    )
+    out["market_dispersion_24h"] = grouped["ret_24h"].transform(
+        lambda s: pd.to_numeric(s, errors="coerce").std(ddof=0)
+    )
+    out["market_trend_strength_24h"] = grouped["ret_24h"].transform("mean")
+    out["market_volume_regime_24h"] = grouped["volume_ratio_1h_vs_24h_avg"].transform("mean")
+
+    # Risk-off style score: weak breadth + negative trend + high dispersion
+    breadth_term = 0.5 - pd.to_numeric(out["market_breadth_up_24h"], errors="coerce")
+    trend_term = -pd.to_numeric(out["market_trend_strength_24h"], errors="coerce")
+    dispersion_term = pd.to_numeric(out["market_dispersion_1h"], errors="coerce")
+    out["market_risk_off_score"] = (
+        breadth_term.fillna(0.0)
+        + trend_term.fillna(0.0)
+        + dispersion_term.fillna(0.0)
+    )
+
+    # Rolling correlation / beta to market per asset stream
+    groups: list[pd.DataFrame] = []
+    for _, asset_df in out.groupby(symbol_column, sort=False, dropna=False):
+        enhanced = _compute_rolling_corr_beta(
+            asset_df,
+            timestamp_column=timestamp_column,
+            asset_return_column="ret_1h",
+            market_return_column="market_ret_1h_ex_self",
+            window=24,
+            min_periods=12,
+        )
+        groups.append(enhanced)
+
+    out = pd.concat(groups, ignore_index=True)
+    return out.sort_values([timestamp_column, symbol_column]).reset_index(drop=True)
 
 
 def build_feature_frame(
@@ -401,7 +603,13 @@ def build_feature_frame(
     if not groups:
         raise BuildSpikeFeaturesError("No asset groups were produced from the base frame")
 
-    return pd.concat(groups, ignore_index=True)
+    feature_frame = pd.concat(groups, ignore_index=True)
+    feature_frame = add_cross_asset_and_regime_features(
+        feature_frame,
+        timestamp_column=timestamp_column,
+        symbol_column="symbol",
+    )
+    return feature_frame
 
 
 def _preferred_tail_label_column(columns: Sequence[str]) -> str | None:
@@ -494,7 +702,7 @@ def merge_with_labels(
 
 
 def _build_value_summary_row(feature_frame: pd.DataFrame, column: str) -> dict[str, object]:
-    series = feature_frame[column]
+    series = pd.to_numeric(feature_frame[column], errors="coerce")
     non_null = series.dropna()
     return {
         "metric_type": "feature",
@@ -546,7 +754,15 @@ def build_summary_frame(feature_frame: pd.DataFrame) -> pd.DataFrame:
     for column in quality_columns:
         if column not in feature_frame.columns:
             continue
-        metric_type = "join" if column in {"has_label_row", *[f"has_spike_label_{h}" for h in SUPPORTED_HORIZONS], *[f"has_tradeable_label_{h}" for h in SUPPORTED_HORIZONS]} else "quality"
+        metric_type = (
+            "join"
+            if column in {
+                "has_label_row",
+                *[f"has_spike_label_{h}" for h in SUPPORTED_HORIZONS],
+                *[f"has_tradeable_label_{h}" for h in SUPPORTED_HORIZONS],
+            }
+            else "quality"
+        )
         summary_rows.append(_build_binary_summary_row(feature_frame, metric_type, column))
 
     alias_rows: list[tuple[str, str]] = [
