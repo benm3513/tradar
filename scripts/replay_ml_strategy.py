@@ -1,8 +1,9 @@
+
 """Replay an ML-driven long-only spike strategy from saved model predictions.
 
 Research-only replay script for Phase 4/5 Tradar development.
 
-Phase 4.7 upgrades
+Phase 4.8 upgrades
 ------------------
 - Supports multi-horizon prediction sources:
     - ensemble
@@ -13,6 +14,11 @@ Phase 4.7 upgrades
 - Uses ensemble_score for ranking when prediction_source=ensemble
 - Preserves backward compatibility with single-model prediction tables
 - Allows explicit score-column override for experiments
+- Adds configurable regime gating using context-table regime features:
+    - market_risk_off_score
+    - market_dispersion_24h
+    - market_trend_strength_24h
+    - market_volume_regime_24h
 
 Inputs
 ------
@@ -23,13 +29,7 @@ Inputs
        symbol, timestamp, ensemble_score[, prob_ensemble, prob_6h, prob_24h, prob_72h]
 2. price table: symbol, timestamp, price_close
 3. optional context table: symbol, timestamp, rolling_volatility_24h,
-   target_time_to_peak_seconds_24h
-
-At each timestamp, the replay:
-- updates exits for currently open positions using the current close
-- ranks current candidates cross-sectionally
-- applies optional candidate filters
-- opens top-ranked long positions subject to position/cash limits
+   target_time_to_peak_seconds_24h, and optional regime columns
 """
 
 from __future__ import annotations
@@ -42,10 +42,39 @@ from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+import yaml
 
 from tradarbot.risk.risk_manager import RiskManager
 
 LOGGER = logging.getLogger("replay_ml_strategy")
+
+
+def _nested_get(mapping: dict, path: tuple[str, ...], default=None):
+    cur = mapping
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return default
+        cur = cur[key]
+    return cur
+
+
+def _load_replay_defaults(config_path: str | None) -> dict:
+    """Load defaults exclusively from the top-level `ml_replay` config section."""
+    if not config_path:
+        return {}
+    try:
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+    section = _nested_get(cfg, ("ml_replay",), {})
+    return section if isinstance(section, dict) else {}
+
+
+REGIME_COL_RISK_OFF = "market_risk_off_score"
+REGIME_COL_DISPERSION_24H = "market_dispersion_24h"
+REGIME_COL_TREND_STRENGTH_24H = "market_trend_strength_24h"
+REGIME_COL_VOLUME_REGIME_24H = "market_volume_regime_24h"
 
 
 @dataclass
@@ -105,6 +134,7 @@ class ReplayDiagnostics:
     candidate_rows_after_volatility: int = 0
     candidate_rows_after_time_to_peak: int = 0
     candidate_rows_after_rank_score: int = 0
+    candidate_rows_after_regime_gate: int = 0
     entries_submitted: int = 0
     entries_opened: int = 0
     skipped_already_open: int = 0
@@ -118,20 +148,28 @@ class ReplayDiagnostics:
     daily_loss_triggered: int = 0
     exposure_violations: int = 0
     trades_blocked_by_risk: int = 0
+    regime_gate_blocks: int = 0
+    regime_scale_events: int = 0
+    regime_score_raise_events: int = 0
     forced_exits: int = 0
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--db-path", required=True)
-    parser.add_argument("--predictions-table", default="spike_model_predictions_hgb")
-    parser.add_argument("--price-table", default="spike_base_rows")
-    parser.add_argument("--context-table", default="spike_training_rows")
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default="config/tradar.yaml")
+    known, _ = pre.parse_known_args()
+    defaults = _load_replay_defaults(known.config)
+
+    parser = argparse.ArgumentParser(parents=[pre])
+    parser.add_argument("--db-path", default=defaults.get("db_path", "tradarbot.db"))
+    parser.add_argument("--predictions-table", default=defaults.get("predictions_table", "spike_model_predictions_hgb"))
+    parser.add_argument("--price-table", default=defaults.get("price_table", "spike_base_rows"))
+    parser.add_argument("--context-table", default=defaults.get("context_table", "spike_training_rows"))
 
     parser.add_argument(
         "--prediction-source",
         choices=["ensemble", "6h", "24h", "72h", "direct"],
-        default="direct",
+        default=defaults.get("prediction_source", "direct"),
         help=(
             "Prediction source mode. "
             "'ensemble' expects ensemble_score/prob_ensemble style tables. "
@@ -139,86 +177,87 @@ def parse_args() -> argparse.Namespace:
             "'direct' preserves legacy behavior."
         ),
     )
-    parser.add_argument(
-        "--score-column",
-        default=None,
-        help=(
-            "Optional override for ranking score column. "
-            "Defaults to ensemble_score for ensemble mode and pred_prob otherwise."
-        ),
-    )
+    parser.add_argument("--score-column", default=defaults.get("score_column"))
 
-    parser.add_argument("--symbol-column", default="symbol")
-    parser.add_argument("--timestamp-column", default="timestamp")
-    parser.add_argument("--price-column", default="price_close")
-    parser.add_argument("--prob-column", default="pred_prob")
-    parser.add_argument("--model-name-column", default="model_name")
-    parser.add_argument("--rolling-volatility-column", default="rolling_volatility_24h")
-    parser.add_argument("--time-to-peak-seconds-column", default="target_time_to_peak_seconds_24h")
+    parser.add_argument("--symbol-column", default=defaults.get("symbol_column", "symbol"))
+    parser.add_argument("--timestamp-column", default=defaults.get("timestamp_column", "timestamp"))
+    parser.add_argument("--price-column", default=defaults.get("price_column", "price_close"))
+    parser.add_argument("--prob-column", default=defaults.get("prob_column", "pred_prob"))
+    parser.add_argument("--model-name-column", default=defaults.get("model_name_column", "model_name"))
+    parser.add_argument("--rolling-volatility-column", default=defaults.get("rolling_volatility_column", "rolling_volatility_24h"))
+    parser.add_argument("--time-to-peak-seconds-column", default=defaults.get("time_to_peak_seconds_column", "target_time_to_peak_seconds_24h"))
 
-    parser.add_argument("--prob-threshold", type=float, default=0.18)
-    parser.add_argument("--min-prob-percentile", type=float, default=0.0)
-    parser.add_argument("--min-rolling-volatility-24h", type=float, default=None)
-    parser.add_argument("--max-predicted-time-to-peak-hours", type=float, default=None)
+    parser.add_argument("--prob-threshold", type=float, default=defaults.get("prob_threshold", 0.18))
+    parser.add_argument("--min-prob-percentile", type=float, default=defaults.get("min_prob_percentile", 0.0))
+    parser.add_argument("--min-rolling-volatility-24h", type=float, default=defaults.get("min_rolling_volatility_24h"))
+    parser.add_argument("--max-predicted-time-to-peak-hours", type=float, default=defaults.get("max_predicted_time_to_peak_hours"))
 
-    parser.add_argument("--ranking-mode", choices=["probability", "composite"], default="composite")
-    parser.add_argument("--prob-zscore-weight", type=float, default=1.00)
-    parser.add_argument("--percentile-weight", type=float, default=0.20)
-    parser.add_argument("--volatility-weight", type=float, default=0.35)
-    parser.add_argument("--time-to-peak-weight", type=float, default=0.25)
-    parser.add_argument("--rank-score-min", type=float, default=None)
+    parser.add_argument("--ranking-mode", choices=["probability", "composite"], default=defaults.get("ranking_mode", "composite"))
+    parser.add_argument("--prob-zscore-weight", type=float, default=defaults.get("prob_zscore_weight", 1.00))
+    parser.add_argument("--percentile-weight", type=float, default=defaults.get("percentile_weight", 0.20))
+    parser.add_argument("--volatility-weight", type=float, default=defaults.get("volatility_weight", 0.35))
+    parser.add_argument("--time-to-peak-weight", type=float, default=defaults.get("time_to_peak_weight", 0.25))
+    parser.add_argument("--rank-score-min", type=float, default=defaults.get("rank_score_min"))
 
-    parser.add_argument("--top-n", type=int, default=3)
-    parser.add_argument("--max-positions", type=int, default=3)
-    parser.add_argument("--enable-dynamic-max-positions", action="store_true")
-    parser.add_argument("--min-dynamic-max-positions", type=int, default=1)
-    parser.add_argument("--dynamic-position-score-threshold", type=float, default=0.15)
-    parser.add_argument("--notional-per-trade", type=float, default=1000.0)
-    parser.add_argument("--min-notional-per-trade", type=float, default=0.0)
-    parser.add_argument("--initial-cash", "--starting-equity-usd", dest="initial_cash", type=float, default=100000.0)
+    parser.add_argument("--top-n", type=int, default=defaults.get("top_n", 3))
+    parser.add_argument("--max-positions", type=int, default=defaults.get("max_positions", 3))
+    parser.add_argument("--enable-dynamic-max-positions", action="store_true", default=defaults.get("enable_dynamic_max_positions", False))
+    parser.add_argument("--min-dynamic-max-positions", type=int, default=defaults.get("min_dynamic_max_positions", 1))
+    parser.add_argument("--dynamic-position-score-threshold", type=float, default=defaults.get("dynamic_position_score_threshold", 0.15))
+    parser.add_argument("--notional-per-trade", type=float, default=defaults.get("notional_per_trade", 1000.0))
+    parser.add_argument("--min-notional-per-trade", type=float, default=defaults.get("min_notional_per_trade", 0.0))
+    parser.add_argument("--initial-cash", "--starting-equity-usd", dest="initial_cash", type=float, default=defaults.get("initial_cash", 100000.0))
 
-    parser.add_argument("--enable-dynamic-sizing", action="store_true")
-    parser.add_argument("--prob-size-cap", type=float, default=2.0)
-    parser.add_argument("--vol-reference", type=float, default=0.006)
-    parser.add_argument("--vol-size-floor", type=float, default=0.75)
-    parser.add_argument("--vol-size-cap", type=float, default=1.25)
-    parser.add_argument("--combined-size-cap", type=float, default=2.0)
+    parser.add_argument("--enable-dynamic-sizing", action="store_true", default=defaults.get("enable_dynamic_sizing", False))
+    parser.add_argument("--prob-size-cap", type=float, default=defaults.get("prob_size_cap", 2.0))
+    parser.add_argument("--vol-reference", type=float, default=defaults.get("vol_reference", 0.006))
+    parser.add_argument("--vol-size-floor", type=float, default=defaults.get("vol_size_floor", 0.75))
+    parser.add_argument("--vol-size-cap", type=float, default=defaults.get("vol_size_cap", 1.25))
+    parser.add_argument("--combined-size-cap", type=float, default=defaults.get("combined_size_cap", 2.0))
 
-    parser.add_argument("--enable-kelly-sizing", action="store_true")
-    parser.add_argument("--kelly-fraction-scale", type=float, default=0.25)
-    parser.add_argument("--kelly-probability-mode", choices=["raw", "threshold_relative"], default="threshold_relative")
-    parser.add_argument("--kelly-size-cap", type=float, default=1.5)
+    parser.add_argument("--enable-kelly-sizing", action="store_true", default=defaults.get("enable_kelly_sizing", False))
+    parser.add_argument("--kelly-fraction-scale", type=float, default=defaults.get("kelly_fraction_scale", 0.25))
+    parser.add_argument("--kelly-probability-mode", choices=["raw", "threshold_relative"], default=defaults.get("kelly_probability_mode", "threshold_relative"))
+    parser.add_argument("--kelly-size-cap", type=float, default=defaults.get("kelly_size_cap", 1.5))
 
-    parser.add_argument("--take-profit-pct", type=float, default=0.08)
-    parser.add_argument("--stop-loss-pct", type=float, default=0.04)
-    parser.add_argument("--max-hold-hours", type=float, default=24.0)
-    parser.add_argument("--trailing-stop-pct", type=float, default=0.05)
-    parser.add_argument("--trailing-stop-activation-pct", type=float, default=0.08)
-    parser.add_argument("--partial-take-profit-pct", type=float, default=0.10)
-    parser.add_argument("--partial-take-profit-fraction", type=float, default=0.50)
-    parser.add_argument("--time-stop-hours", type=float, default=None)
-    parser.add_argument("--time-stop-min-return-pct", type=float, default=0.01)
+    parser.add_argument("--take-profit-pct", type=float, default=defaults.get("take_profit_pct", 0.08))
+    parser.add_argument("--stop-loss-pct", type=float, default=defaults.get("stop_loss_pct", 0.04))
+    parser.add_argument("--max-hold-hours", type=float, default=defaults.get("max_hold_hours", 24.0))
+    parser.add_argument("--trailing-stop-pct", type=float, default=defaults.get("trailing_stop_pct", 0.05))
+    parser.add_argument("--trailing-stop-activation-pct", type=float, default=defaults.get("trailing_stop_activation_pct", 0.08))
+    parser.add_argument("--partial-take-profit-pct", type=float, default=defaults.get("partial_take_profit_pct", 0.10))
+    parser.add_argument("--partial-take-profit-fraction", type=float, default=defaults.get("partial_take_profit_fraction", 0.50))
+    parser.add_argument("--time-stop-hours", type=float, default=defaults.get("time_stop_hours"))
+    parser.add_argument("--time-stop-min-return-pct", type=float, default=defaults.get("time_stop_min_return_pct", 0.01))
 
-    parser.add_argument("--enable-risk-manager", action="store_true")
-    parser.add_argument("--max-daily-loss-usd", type=float, default=None)
-    parser.add_argument("--max-total-exposure-usd", type=float, default=None)
-    parser.add_argument("--max-total-exposure-pct", type=float, default=None)
-    parser.add_argument("--max-exposure-per-symbol-usd", type=float, default=None)
-    parser.add_argument("--max-drawdown-pct", type=float, default=None)
-    parser.add_argument("--cooldown-minutes-per-symbol", type=float, default=0.0)
+    parser.add_argument("--enable-risk-manager", action="store_true", default=defaults.get("enable_risk_manager", False))
+    parser.add_argument("--max-daily-loss-usd", type=float, default=defaults.get("max_daily_loss_usd"))
+    parser.add_argument("--max-total-exposure-usd", type=float, default=defaults.get("max_total_exposure_usd"))
+    parser.add_argument("--max-total-exposure-pct", type=float, default=defaults.get("max_total_exposure_pct"))
+    parser.add_argument("--max-exposure-per-symbol-usd", type=float, default=defaults.get("max_exposure_per_symbol_usd"))
+    parser.add_argument("--max-drawdown-pct", type=float, default=defaults.get("max_drawdown_pct"))
+    parser.add_argument("--cooldown-minutes-per-symbol", type=float, default=defaults.get("cooldown_minutes_per_symbol", 0.0))
 
-    parser.add_argument("--enable-drawdown-scaling", action="store_true")
-    parser.add_argument("--drawdown-full-size-pct", type=float, default=0.04)
-    parser.add_argument("--drawdown-half-size-pct", type=float, default=0.06)
-    parser.add_argument("--drawdown-quarter-size-pct", type=float, default=0.08)
-    parser.add_argument("--drawdown-half-size-multiplier", type=float, default=0.50)
-    parser.add_argument("--drawdown-quarter-size-multiplier", type=float, default=0.25)
+    parser.add_argument("--enable-drawdown-scaling", action="store_true", default=defaults.get("enable_drawdown_scaling", False))
+    parser.add_argument("--drawdown-full-size-pct", type=float, default=defaults.get("drawdown_full_size_pct", 0.04))
+    parser.add_argument("--drawdown-half-size-pct", type=float, default=defaults.get("drawdown_half_size_pct", 0.06))
+    parser.add_argument("--drawdown-quarter-size-pct", type=float, default=defaults.get("drawdown_quarter_size_pct", 0.08))
+    parser.add_argument("--drawdown-half-size-multiplier", type=float, default=defaults.get("drawdown_half_size_multiplier", 0.50))
+    parser.add_argument("--drawdown-quarter-size-multiplier", type=float, default=defaults.get("drawdown_quarter_size_multiplier", 0.25))
 
-    parser.add_argument("--trades-table", default="ml_replay_trades")
-    parser.add_argument("--equity-table", default="ml_replay_equity")
-    parser.add_argument("--summary-table", default="ml_replay_summary")
-    parser.add_argument("--if-exists", choices=["fail", "replace", "append"], default="replace")
-    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
+    parser.add_argument("--enable-regime-gating", action="store_true", default=defaults.get("enable_regime_gating", False))
+    parser.add_argument("--regime-gating-mode", choices=["block", "scale", "score_raise"], default=defaults.get("regime_gating_mode", "block"))
+    parser.add_argument("--max-market-risk-off-score", type=float, default=defaults.get("max_market_risk_off_score"))
+    parser.add_argument("--max-market-dispersion-24h", type=float, default=defaults.get("max_market_dispersion_24h"))
+    parser.add_argument("--min-market-trend-strength-24h", type=float, default=defaults.get("min_market_trend_strength_24h"))
+    parser.add_argument("--risk-off-size-multiplier", type=float, default=defaults.get("risk_off_size_multiplier", 0.50))
+    parser.add_argument("--risk-off-score-raise", type=float, default=defaults.get("risk_off_score_raise", 0.0))
+
+    parser.add_argument("--trades-table", default=defaults.get("trades_table", "ml_replay_trades"))
+    parser.add_argument("--equity-table", default=defaults.get("equity_table", "ml_replay_equity"))
+    parser.add_argument("--summary-table", default=defaults.get("summary_table", "ml_replay_summary"))
+    parser.add_argument("--if-exists", choices=["fail", "replace", "append"], default=defaults.get("if_exists", "replace"))
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default=defaults.get("log_level", "INFO"))
     return parser.parse_args()
 
 
@@ -331,13 +370,19 @@ def load_context(conn: sqlite3.Connection, args: argparse.Namespace) -> pd.DataF
     df = df.copy()
     df[args.timestamp_column] = pd.to_datetime(df[args.timestamp_column], utc=True, errors="raise")
 
-    if args.rolling_volatility_column not in df.columns:
-        df[args.rolling_volatility_column] = pd.NA
-    if args.time_to_peak_seconds_column not in df.columns:
-        df[args.time_to_peak_seconds_column] = pd.NA
+    optional_numeric_columns = [
+        args.rolling_volatility_column,
+        args.time_to_peak_seconds_column,
+        REGIME_COL_RISK_OFF,
+        REGIME_COL_DISPERSION_24H,
+        REGIME_COL_TREND_STRENGTH_24H,
+        REGIME_COL_VOLUME_REGIME_24H,
+    ]
+    for col in optional_numeric_columns:
+        if col not in df.columns:
+            df[col] = pd.NA
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    df[args.rolling_volatility_column] = pd.to_numeric(df[args.rolling_volatility_column], errors="coerce")
-    df[args.time_to_peak_seconds_column] = pd.to_numeric(df[args.time_to_peak_seconds_column], errors="coerce")
     df["predicted_time_to_peak_hours"] = df[args.time_to_peak_seconds_column] / 3600.0
 
     keep = [
@@ -345,10 +390,17 @@ def load_context(conn: sqlite3.Connection, args: argparse.Namespace) -> pd.DataF
         args.timestamp_column,
         args.rolling_volatility_column,
         "predicted_time_to_peak_hours",
+        REGIME_COL_RISK_OFF,
+        REGIME_COL_DISPERSION_24H,
+        REGIME_COL_TREND_STRENGTH_24H,
+        REGIME_COL_VOLUME_REGIME_24H,
     ]
-    return df[keep].drop_duplicates([args.symbol_column, args.timestamp_column]).sort_values(
-        [args.timestamp_column, args.symbol_column]
-    ).reset_index(drop=True)
+    return (
+        df[keep]
+        .drop_duplicates([args.symbol_column, args.timestamp_column])
+        .sort_values([args.timestamp_column, args.symbol_column])
+        .reset_index(drop=True)
+    )
 
 
 def _safe_group_zscore(series: pd.Series) -> pd.Series:
@@ -395,6 +447,16 @@ def enrich_predictions(predictions: pd.DataFrame, context: pd.DataFrame, args: a
         errors="coerce",
     )
     merged["time_to_peak_zscore"] = merged.groupby(ts_col)["predicted_time_to_peak_hours"].transform(_safe_group_zscore)
+
+    for regime_col in [
+        REGIME_COL_RISK_OFF,
+        REGIME_COL_DISPERSION_24H,
+        REGIME_COL_TREND_STRENGTH_24H,
+        REGIME_COL_VOLUME_REGIME_24H,
+    ]:
+        if regime_col not in merged.columns:
+            merged[regime_col] = pd.NA
+        merged[regime_col] = pd.to_numeric(merged[regime_col], errors="coerce")
 
     if args.ranking_mode == "probability":
         merged["entry_score"] = merged[actual_score_col].astype(float)
@@ -577,6 +639,81 @@ def _compute_dynamic_position_limit(candidates: pd.DataFrame, args: argparse.Nam
     if strong_count <= 0:
         strong_count = 1
     return min(hard_cap, max(min_cap, strong_count))
+
+
+def _regime_condition_triggered(value: object, cmp_name: str, threshold: Optional[float]) -> bool:
+    if threshold is None or pd.isna(value):
+        return False
+    numeric_value = float(value)
+    numeric_threshold = float(threshold)
+    if cmp_name == "gt":
+        return numeric_value > numeric_threshold
+    if cmp_name == "lt":
+        return numeric_value < numeric_threshold
+    raise ValueError(f"Unsupported regime comparison: {cmp_name}")
+
+
+def _row_in_adverse_regime(row: pd.Series, args: argparse.Namespace) -> bool:
+    if not args.enable_regime_gating:
+        return False
+
+    triggered = False
+    triggered = triggered or _regime_condition_triggered(row.get(REGIME_COL_RISK_OFF), "gt", args.max_market_risk_off_score)
+    triggered = triggered or _regime_condition_triggered(row.get(REGIME_COL_DISPERSION_24H), "gt", args.max_market_dispersion_24h)
+    triggered = triggered or _regime_condition_triggered(row.get(REGIME_COL_TREND_STRENGTH_24H), "lt", args.min_market_trend_strength_24h)
+    return triggered
+
+
+def apply_regime_gating(
+    candidates: pd.DataFrame,
+    args: argparse.Namespace,
+    diagnostics: ReplayDiagnostics,
+) -> pd.DataFrame:
+    if candidates.empty:
+        diagnostics.candidate_rows_after_regime_gate += 0
+        return candidates
+    if not args.enable_regime_gating:
+        diagnostics.candidate_rows_after_regime_gate += int(len(candidates))
+        return candidates
+
+    adverse_mask = candidates.apply(lambda row: _row_in_adverse_regime(row, args), axis=1)
+
+    if args.regime_gating_mode == "block":
+        blocked = int(adverse_mask.sum())
+        diagnostics.regime_gate_blocks += blocked
+        gated = candidates.loc[~adverse_mask].copy()
+        diagnostics.candidate_rows_after_regime_gate += int(len(gated))
+        return gated
+
+    if args.regime_gating_mode == "score_raise":
+        # Require stronger candidate quality only when the current row is in an adverse regime.
+        # If rank_score_min is unset, treat the raise itself as the temporary minimum score floor.
+        base_floor = float(args.rank_score_min) if args.rank_score_min is not None else 0.0
+        raised_floor = base_floor + float(args.risk_off_score_raise)
+        if adverse_mask.any():
+            diagnostics.regime_score_raise_events += int(adverse_mask.sum())
+            entry_scores = pd.to_numeric(candidates["entry_score"], errors="coerce")
+            adverse_keep_mask = entry_scores >= raised_floor
+            keep_mask = (~adverse_mask) | adverse_keep_mask
+            gated = candidates.loc[keep_mask].copy()
+            gated["_regime_effective_score_floor"] = base_floor
+            gated.loc[gated.index.intersection(candidates.index[adverse_mask]), "_regime_effective_score_floor"] = raised_floor
+            diagnostics.regime_gate_blocks += int((~keep_mask).sum())
+        else:
+            gated = candidates.copy()
+            gated["_regime_effective_score_floor"] = base_floor
+        diagnostics.candidate_rows_after_regime_gate += int(len(gated))
+        return gated
+
+    if args.regime_gating_mode == "scale":
+        scaled = candidates.copy()
+        if adverse_mask.any():
+            diagnostics.regime_scale_events += int(adverse_mask.sum())
+            scaled.loc[adverse_mask, "_regime_size_multiplier"] = float(args.risk_off_size_multiplier)
+        diagnostics.candidate_rows_after_regime_gate += int(len(scaled))
+        return scaled
+
+    raise ValueError(f"Unsupported regime_gating_mode: {args.regime_gating_mode}")
 
 
 def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -764,6 +901,8 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                 candidates = candidates[candidates["entry_score"] >= float(args.rank_score_min)].copy()
             diagnostics.candidate_rows_after_rank_score += int(len(candidates))
 
+            candidates = apply_regime_gating(candidates, args, diagnostics)
+
             if not candidates.empty:
                 candidates = candidates.sort_values(
                     ["entry_score", resolved_score_col, sym_col],
@@ -791,7 +930,14 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                         continue
 
                     prob_mult, vol_mult, kelly_fraction, kelly_mult, total_mult = compute_size_multipliers(row, args)
-                    target_notional = float(args.notional_per_trade) * total_mult
+
+                    regime_size_multiplier = 1.0
+                    if args.enable_regime_gating and args.regime_gating_mode == "scale":
+                        regime_size_multiplier = float(row.get("_regime_size_multiplier", 1.0) or 1.0)
+                        if regime_size_multiplier != 1.0:
+                            diagnostics.regime_scale_events += 0  # counted during candidate gating
+
+                    target_notional = float(args.notional_per_trade) * total_mult * regime_size_multiplier
 
                     drawdown_size_multiplier = risk_manager.get_position_size_multiplier()
                     if drawdown_size_multiplier <= 0.0:
@@ -846,7 +992,7 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                         vol_size_multiplier=vol_mult,
                         kelly_fraction=kelly_fraction,
                         kelly_multiplier=kelly_mult,
-                        total_size_multiplier=total_mult,
+                        total_size_multiplier=total_mult * regime_size_multiplier,
                         peak_price=float(entry_price),
                         trailing_stop_price=None,
                     )
@@ -870,6 +1016,9 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
         )
         risk_manager.update_equity(equity)
 
+        market_regime_row = predictions_by_ts.get(ts)
+        regime_snapshot = market_regime_row.iloc[0] if market_regime_row is not None and not market_regime_row.empty else None
+
         equity_rows.append(
             {
                 "timestamp": ts.isoformat(),
@@ -883,6 +1032,22 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                 "risk_total_exposure_usd": float(risk_manager.total_exposure),
                 "risk_daily_pnl_usd": float(risk_manager.current_daily_pnl()),
                 "risk_drawdown_pct": float(risk_manager.current_drawdown_pct()),
+                REGIME_COL_RISK_OFF: (
+                    float(regime_snapshot.get(REGIME_COL_RISK_OFF))
+                    if regime_snapshot is not None and pd.notna(regime_snapshot.get(REGIME_COL_RISK_OFF)) else None
+                ),
+                REGIME_COL_DISPERSION_24H: (
+                    float(regime_snapshot.get(REGIME_COL_DISPERSION_24H))
+                    if regime_snapshot is not None and pd.notna(regime_snapshot.get(REGIME_COL_DISPERSION_24H)) else None
+                ),
+                REGIME_COL_TREND_STRENGTH_24H: (
+                    float(regime_snapshot.get(REGIME_COL_TREND_STRENGTH_24H))
+                    if regime_snapshot is not None and pd.notna(regime_snapshot.get(REGIME_COL_TREND_STRENGTH_24H)) else None
+                ),
+                REGIME_COL_VOLUME_REGIME_24H: (
+                    float(regime_snapshot.get(REGIME_COL_VOLUME_REGIME_24H))
+                    if regime_snapshot is not None and pd.notna(regime_snapshot.get(REGIME_COL_VOLUME_REGIME_24H)) else None
+                ),
             }
         )
 
@@ -1021,6 +1186,14 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
         {"metric_name": "drawdown_quarter_size_pct", "metric_value": float(args.drawdown_quarter_size_pct)},
         {"metric_name": "drawdown_half_size_multiplier", "metric_value": float(args.drawdown_half_size_multiplier)},
         {"metric_name": "drawdown_quarter_size_multiplier", "metric_value": float(args.drawdown_quarter_size_multiplier)},
+        {"metric_name": "enable_regime_gating", "metric_value": int(args.enable_regime_gating)},
+        {"metric_name": "regime_gating_mode", "metric_value": None},
+        {"metric_name": "max_market_risk_off_score", "metric_value": float(args.max_market_risk_off_score) if args.max_market_risk_off_score is not None else None},
+        {"metric_name": "max_market_dispersion_24h", "metric_value": float(args.max_market_dispersion_24h) if args.max_market_dispersion_24h is not None else None},
+        {"metric_name": "min_market_trend_strength_24h", "metric_value": float(args.min_market_trend_strength_24h) if args.min_market_trend_strength_24h is not None else None},
+        {"metric_name": "risk_off_size_multiplier", "metric_value": float(args.risk_off_size_multiplier)},
+        {"metric_name": "risk_off_score_raise", "metric_value": float(args.risk_off_score_raise)},
+        {"metric_name": "rank_score_min_base", "metric_value": float(args.rank_score_min) if args.rank_score_min is not None else None},
         {"metric_name": "timestamps_considered", "metric_value": diagnostics.timestamps_considered},
         {"metric_name": "candidate_rows_seen", "metric_value": diagnostics.candidate_rows_seen},
         {"metric_name": "candidate_rows_after_prob_threshold", "metric_value": diagnostics.candidate_rows_after_prob_threshold},
@@ -1028,6 +1201,7 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
         {"metric_name": "candidate_rows_after_volatility", "metric_value": diagnostics.candidate_rows_after_volatility},
         {"metric_name": "candidate_rows_after_time_to_peak", "metric_value": diagnostics.candidate_rows_after_time_to_peak},
         {"metric_name": "candidate_rows_after_rank_score", "metric_value": diagnostics.candidate_rows_after_rank_score},
+        {"metric_name": "candidate_rows_after_regime_gate", "metric_value": diagnostics.candidate_rows_after_regime_gate},
         {"metric_name": "entries_submitted", "metric_value": diagnostics.entries_submitted},
         {"metric_name": "entries_opened", "metric_value": diagnostics.entries_opened},
         {"metric_name": "skipped_already_open", "metric_value": diagnostics.skipped_already_open},
@@ -1041,6 +1215,9 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
         {"metric_name": "daily_loss_triggered", "metric_value": diagnostics.daily_loss_triggered},
         {"metric_name": "exposure_violations", "metric_value": diagnostics.exposure_violations},
         {"metric_name": "trades_blocked_by_risk", "metric_value": diagnostics.trades_blocked_by_risk},
+        {"metric_name": "regime_gate_blocks", "metric_value": diagnostics.regime_gate_blocks},
+        {"metric_name": "regime_scale_events", "metric_value": diagnostics.regime_scale_events},
+        {"metric_name": "regime_score_raise_events", "metric_value": diagnostics.regime_score_raise_events},
         {"metric_name": "forced_exits", "metric_value": diagnostics.forced_exits},
         {"metric_name": "kill_switch_activations", "metric_value": risk_metrics["kill_switch_activations"]},
         {"metric_name": "drawdown_breach_events", "metric_value": risk_metrics["drawdown_breach_events"]},
@@ -1055,6 +1232,7 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
         {"metric_name": "drawdown_scaling_quarter_count", "metric_value": risk_metrics["drawdown_scaling_quarter_count"]},
         {"metric_name": "drawdown_scaling_stop_count", "metric_value": risk_metrics["drawdown_scaling_stop_count"]},
         {"metric_name": "candidate_rate_after_prob_threshold", "metric_value": (diagnostics.candidate_rows_after_prob_threshold / diagnostics.candidate_rows_seen) if diagnostics.candidate_rows_seen else None},
+        {"metric_name": "candidate_rate_after_regime_gate", "metric_value": (diagnostics.candidate_rows_after_regime_gate / diagnostics.candidate_rows_after_rank_score) if diagnostics.candidate_rows_after_rank_score else None},
         {"metric_name": "entry_open_rate", "metric_value": (diagnostics.entries_opened / diagnostics.entries_submitted) if diagnostics.entries_submitted else None},
         {"metric_name": "trade_rate_vs_candidates", "metric_value": (total_trades / diagnostics.candidate_rows_after_prob_threshold) if diagnostics.candidate_rows_after_prob_threshold else None},
         {"metric_name": "trades", "metric_value": total_trades},
@@ -1083,6 +1261,7 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
     summary_df.loc[summary_df["metric_name"] == "prediction_source", "metric_value"] = args.prediction_source
     summary_df.loc[summary_df["metric_name"] == "resolved_prob_column", "metric_value"] = args.prob_column
     summary_df.loc[summary_df["metric_name"] == "resolved_score_column", "metric_value"] = resolved_score_col
+    summary_df.loc[summary_df["metric_name"] == "regime_gating_mode", "metric_value"] = args.regime_gating_mode
 
     return trades_df, equity_df, summary_df
 
