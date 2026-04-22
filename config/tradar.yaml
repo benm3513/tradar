@@ -1,48 +1,43 @@
 env: paper
 exchange: binance_spot_testnet
-
-data_source: rest_poll  # rest_poll or ws
+data_source: rest_poll
 min_move_bps: 2
-
 rest_poll:
-  interval_s: 0.5        # 2 Hz per symbol batch
-  endpoint: ticker_book  # ticker_book or ticker_price
-
+  interval_s: 0.5
+  endpoint: ticker_book
 binance:
-  data_rest_base_url: "https://api.binance.us/api"
-  exec_rest_base_url: "https://testnet.binance.vision/api"
-  exchange_info_url: "https://api.binance.us/api/v3/exchangeInfo"
-
+  data_rest_base_url: https://api.binance.us/api
+  exec_rest_base_url: https://testnet.binance.vision/api
+  exchange_info_url: https://api.binance.us/api/v3/exchangeInfo
 symbol_registry:
   enabled: true
   poll_interval_s: 15
   quote_asset: USDT
   status: TRADING
   allowlist:
-    - BTCUSDT
-    - ETHUSDT
-    - BNBUSDT
+  - BTCUSDT
+  - ETHUSDT
+  - BNBUSDT
   denylist: []
   emit_listing_events: true
-
 ws:
   shard_size: 60
   stream_types:
-    - bookTicker
-  reconnect_backoff_s: [1, 2, 5, 10, 30]
-
+  - bookTicker
+  reconnect_backoff_s:
+  - 1
+  - 2
+  - 5
+  - 10
+  - 30
 runtime:
   candle_interval_s: 1
   log_level: INFO
-
-# Live app / rule-based engine execution settings.
 execution:
   fee_bps: 10
   entry_slippage_cap_pct: 0.0025
   exit_slippage_cap_pct: 0.0025
   max_spread_pct: 0.02
-
-# Live app / rule-based engine risk settings.
 risk:
   max_positions: 3
   cooldown_s: 0
@@ -50,7 +45,6 @@ risk:
   max_position_notional_usd: 3000
   max_daily_loss_usd: 100000
   max_orders_per_minute: 9999
-
 strategies:
   algo1_new_listing_pump:
     enabled: true
@@ -61,9 +55,8 @@ strategies:
     stop_bps: 20
     exhaustion_reversal_bps: 5
     max_hold_s: 120
-    notional_fraction: 0.10
+    notional_fraction: 0.1
     price_cap: null
-
   algo2_micro_momentum:
     enabled: false
     min_move_bps: 1
@@ -72,73 +65,184 @@ strategies:
     max_hold_s: 60
     notional_fraction: 0.05
     price_cap: null
-
-# ML replay / sweep settings only. These are intentionally isolated from the
-# live app's top-level risk/execution/strategies sections to avoid conflicts.
 ml_replay:
   db_path: tradarbot.db
   predictions_table: spike_model_predictions_v50_sig_importance_ensemble
   price_table: spike_base_rows
   context_table: spike_training_rows_v48_sig
   prediction_source: ensemble
-
-  prob_threshold: 0.10
+  symbol_column: symbol
+  timestamp_column: timestamp
+  price_column: price_close
+  prob_column: pred_prob
+  model_name_column: model_name
+  rolling_volatility_column: rolling_volatility_24h
+  time_to_peak_seconds_column: target_time_to_peak_seconds_24h
+  prob_threshold: 0.1
   min_prob_percentile: 0.985
   top_n: 1
   max_positions: 3
-
   ranking_mode: composite
   prob_zscore_weight: 1.0
   percentile_weight: 0.2
   volatility_weight: 0.35
   time_to_peak_weight: 0.25
   rank_score_min: null
-
   notional_per_trade: 2500
   min_notional_per_trade: 0
   initial_cash: 100000
-
   enable_dynamic_sizing: true
   prob_size_cap: 2.5
   vol_reference: 0.006
   vol_size_floor: 0.75
   vol_size_cap: 1.25
   combined_size_cap: 2.2
-
   enable_kelly_sizing: true
-  kelly_fraction_scale: 0.40
+  kelly_fraction_scale: 0.4
   kelly_probability_mode: threshold_relative
   kelly_size_cap: 1.5
-
-  take_profit_pct: 0.20
+  take_profit_pct: 0.2
   stop_loss_pct: 0.06
   max_hold_hours: 24
   trailing_stop_pct: 0.05
   trailing_stop_activation_pct: 0.08
-  partial_take_profit_pct: 0.10
+  partial_take_profit_pct: 0.1
   partial_take_profit_fraction: 0.5
   time_stop_hours: null
   time_stop_min_return_pct: 0.01
-
   enable_risk_manager: true
   max_daily_loss_usd: 4000
   max_total_exposure_usd: 20000
   max_total_exposure_pct: null
   max_exposure_per_symbol_usd: 7000
   cooldown_minutes_per_symbol: 120
-
   enable_drawdown_scaling: true
   max_drawdown_pct: 0.08
   drawdown_full_size_pct: 0.04
   drawdown_half_size_pct: 0.06
   drawdown_quarter_size_pct: 0.08
-  drawdown_half_size_multiplier: 0.50
+  drawdown_half_size_multiplier: 0.5
   drawdown_quarter_size_multiplier: 0.25
-
   enable_regime_gating: true
   regime_gating_mode: scale
-  max_market_risk_off_score: 0.70
+  max_market_risk_off_score: 0.7
   max_market_dispersion_24h: null
   min_market_trend_strength_24h: null
-  risk_off_size_multiplier: 0.20
+  risk_off_size_multiplier: 0.2
   risk_off_score_raise: 0.0
+  prob_thresholds:
+  - 0.1
+  take_profit_pcts:
+  - 0.2
+  stop_loss_pcts:
+  - 0.06
+  top_n_values:
+  - 1
+  max_positions_values:
+  - 3
+  kelly_fraction_scales:
+  - 0.4
+  combined_size_caps:
+  - 2.2
+  max_drawdown_pcts:
+  - 0.08
+  drawdown_full_size_pcts:
+  - 0.04
+  drawdown_half_size_pcts:
+  - 0.06
+  drawdown_quarter_size_pcts:
+  - 0.08
+  drawdown_half_size_multipliers:
+  - 0.5
+  drawdown_quarter_size_multipliers:
+  - 0.25
+  max_market_risk_off_scores:
+  - 0.7
+  risk_off_size_multipliers:
+  - 0.2
+  risk_off_score_raises:
+  - 0.0
+  weight_6h: 0.3
+  weight_24h: 0.5
+  weight_72h: 0.2
+  rebuild_ensemble_per_run: false
+  ensemble_output_table: spike_model_predictions_ensemble
+  ensemble_table_6h: spike_model_predictions_6h
+  ensemble_table_24h: spike_model_predictions_24h
+  ensemble_table_72h: spike_model_predictions_72h
+  ensemble_agreement_threshold: 0.8
+  ensemble_agreement_boost: 0.05
+ml_live:
+  enabled: true
+  mode: heuristic
+  prediction_source: ensemble
+  predictions_table: spike_model_predictions_v50_sig_importance_ensemble
+  score_column: null
+  symbol_column: symbol
+  timestamp_column: timestamp
+  price_column: price_close
+  prob_column: pred_prob
+  model_name_column: model_name
+  rolling_volatility_column: rolling_volatility_24h
+  time_to_peak_seconds_column: target_time_to_peak_seconds_24h
+  max_prediction_age_minutes: 180.0
+  prob_threshold: 0.1
+  min_prob_percentile: 0.0
+  min_rolling_volatility_24h: null
+  max_predicted_time_to_peak_hours: null
+  ranking_mode: composite
+  prob_zscore_weight: 1.0
+  percentile_weight: 0.2
+  volatility_weight: 0.35
+  time_to_peak_weight: 0.25
+  rank_score_min: null
+  top_n: 1
+  max_positions: 1
+  enable_dynamic_max_positions: true
+  min_dynamic_max_positions: 1
+  dynamic_position_score_threshold: 0.15
+  notional_per_trade: 250.0
+  min_notional_per_trade: 25.0
+  enable_dynamic_sizing: true
+  prob_size_cap: 2.5
+  vol_reference: 0.006
+  vol_size_floor: 0.75
+  vol_size_cap: 1.25
+  combined_size_cap: 2.2
+  enable_kelly_sizing: true
+  kelly_fraction_scale: 0.4
+  kelly_probability_mode: threshold_relative
+  kelly_size_cap: 1.5
+  take_profit_pct: 0.2
+  stop_loss_pct: 0.06
+  max_hold_hours: 24
+  trailing_stop_pct: 0.05
+  trailing_stop_activation_pct: 0.08
+  partial_take_profit_pct: 0.1
+  partial_take_profit_fraction: 0.5
+  time_stop_hours: null
+  time_stop_min_return_pct: 0.01
+  enable_risk_manager: true
+  max_daily_loss_usd: 4000
+  max_total_exposure_usd: 20000
+  max_total_exposure_pct: null
+  max_exposure_per_symbol_usd: 7000
+  max_drawdown_pct: 0.08
+  cooldown_minutes_per_symbol: 120
+  enable_drawdown_scaling: true
+  drawdown_full_size_pct: 0.04
+  drawdown_half_size_pct: 0.06
+  drawdown_quarter_size_pct: 0.08
+  drawdown_half_size_multiplier: 0.5
+  drawdown_quarter_size_multiplier: 0.25
+  enable_regime_gating: true
+  regime_gating_mode: scale
+  max_market_risk_off_score: 0.7
+  max_market_dispersion_24h: null
+  min_market_trend_strength_24h: null
+  risk_off_size_multiplier: 0.2
+  risk_off_score_raise: 0.0
+  feature_lookback_bars: 168
+  feature_interval_s: 3600
+  candles_table: candles
+  emit_observer_events: true

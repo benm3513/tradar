@@ -716,6 +716,256 @@ def apply_regime_gating(
     raise ValueError(f"Unsupported regime_gating_mode: {args.regime_gating_mode}")
 
 
+
+def build_runtime_args(overrides: Optional[dict] = None, *, config_path: Optional[str] = None, section: str = "ml_replay") -> argparse.Namespace:
+    """Build an argparse-style namespace for replay or live imports.
+
+    Phase 5.0 uses this so live strategy code can import replay math without
+    depending on CLI parsing. By default it reads the same top-level `ml_replay`
+    section the script already uses, but callers may point it at `ml_live`.
+    """
+    if config_path is None:
+        config_path = "config/tradar.yaml"
+
+    defaults = {}
+    try:
+        with open(config_path, "r") as f:
+            cfg = yaml.safe_load(f) or {}
+        section_data = _nested_get(cfg, (section,), {})
+        if isinstance(section_data, dict):
+            defaults.update(section_data)
+    except FileNotFoundError:
+        pass
+
+    if overrides:
+        defaults.update(dict(overrides))
+
+    return argparse.Namespace(
+        db_path=defaults.get("db_path", "tradarbot.db"),
+        predictions_table=defaults.get("predictions_table", "spike_model_predictions_hgb"),
+        price_table=defaults.get("price_table", "spike_base_rows"),
+        context_table=defaults.get("context_table", "spike_training_rows"),
+        prediction_source=defaults.get("prediction_source", "direct"),
+        score_column=defaults.get("score_column"),
+        symbol_column=defaults.get("symbol_column", "symbol"),
+        timestamp_column=defaults.get("timestamp_column", "timestamp"),
+        price_column=defaults.get("price_column", "price_close"),
+        prob_column=defaults.get("prob_column", "pred_prob"),
+        model_name_column=defaults.get("model_name_column", "model_name"),
+        rolling_volatility_column=defaults.get("rolling_volatility_column", "rolling_volatility_24h"),
+        time_to_peak_seconds_column=defaults.get("time_to_peak_seconds_column", "target_time_to_peak_seconds_24h"),
+        prob_threshold=defaults.get("prob_threshold", 0.18),
+        min_prob_percentile=defaults.get("min_prob_percentile", 0.0),
+        min_rolling_volatility_24h=defaults.get("min_rolling_volatility_24h"),
+        max_predicted_time_to_peak_hours=defaults.get("max_predicted_time_to_peak_hours"),
+        ranking_mode=defaults.get("ranking_mode", "composite"),
+        prob_zscore_weight=defaults.get("prob_zscore_weight", 1.00),
+        percentile_weight=defaults.get("percentile_weight", 0.20),
+        volatility_weight=defaults.get("volatility_weight", 0.35),
+        time_to_peak_weight=defaults.get("time_to_peak_weight", 0.25),
+        rank_score_min=defaults.get("rank_score_min"),
+        top_n=defaults.get("top_n", 3),
+        max_positions=defaults.get("max_positions", 3),
+        enable_dynamic_max_positions=defaults.get("enable_dynamic_max_positions", False),
+        min_dynamic_max_positions=defaults.get("min_dynamic_max_positions", 1),
+        dynamic_position_score_threshold=defaults.get("dynamic_position_score_threshold", 0.15),
+        notional_per_trade=defaults.get("notional_per_trade", 1000.0),
+        min_notional_per_trade=defaults.get("min_notional_per_trade", 0.0),
+        initial_cash=defaults.get("initial_cash", 100000.0),
+        enable_dynamic_sizing=defaults.get("enable_dynamic_sizing", False),
+        prob_size_cap=defaults.get("prob_size_cap", 2.0),
+        vol_reference=defaults.get("vol_reference", 0.006),
+        vol_size_floor=defaults.get("vol_size_floor", 0.75),
+        vol_size_cap=defaults.get("vol_size_cap", 1.25),
+        combined_size_cap=defaults.get("combined_size_cap", 2.0),
+        enable_kelly_sizing=defaults.get("enable_kelly_sizing", False),
+        kelly_fraction_scale=defaults.get("kelly_fraction_scale", 0.25),
+        kelly_probability_mode=defaults.get("kelly_probability_mode", "threshold_relative"),
+        kelly_size_cap=defaults.get("kelly_size_cap", 1.5),
+        take_profit_pct=defaults.get("take_profit_pct", 0.08),
+        stop_loss_pct=defaults.get("stop_loss_pct", 0.04),
+        max_hold_hours=defaults.get("max_hold_hours", 24.0),
+        trailing_stop_pct=defaults.get("trailing_stop_pct", 0.05),
+        trailing_stop_activation_pct=defaults.get("trailing_stop_activation_pct", 0.08),
+        partial_take_profit_pct=defaults.get("partial_take_profit_pct", 0.10),
+        partial_take_profit_fraction=defaults.get("partial_take_profit_fraction", 0.50),
+        time_stop_hours=defaults.get("time_stop_hours"),
+        time_stop_min_return_pct=defaults.get("time_stop_min_return_pct", 0.01),
+        enable_risk_manager=defaults.get("enable_risk_manager", False),
+        max_daily_loss_usd=defaults.get("max_daily_loss_usd"),
+        max_total_exposure_usd=defaults.get("max_total_exposure_usd"),
+        max_total_exposure_pct=defaults.get("max_total_exposure_pct"),
+        max_exposure_per_symbol_usd=defaults.get("max_exposure_per_symbol_usd"),
+        max_drawdown_pct=defaults.get("max_drawdown_pct"),
+        cooldown_minutes_per_symbol=defaults.get("cooldown_minutes_per_symbol", 0.0),
+        enable_drawdown_scaling=defaults.get("enable_drawdown_scaling", False),
+        drawdown_full_size_pct=defaults.get("drawdown_full_size_pct", 0.04),
+        drawdown_half_size_pct=defaults.get("drawdown_half_size_pct", 0.06),
+        drawdown_quarter_size_pct=defaults.get("drawdown_quarter_size_pct", 0.08),
+        drawdown_half_size_multiplier=defaults.get("drawdown_half_size_multiplier", 0.50),
+        drawdown_quarter_size_multiplier=defaults.get("drawdown_quarter_size_multiplier", 0.25),
+        enable_regime_gating=defaults.get("enable_regime_gating", False),
+        regime_gating_mode=defaults.get("regime_gating_mode", "block"),
+        max_market_risk_off_score=defaults.get("max_market_risk_off_score"),
+        max_market_dispersion_24h=defaults.get("max_market_dispersion_24h"),
+        min_market_trend_strength_24h=defaults.get("min_market_trend_strength_24h"),
+        risk_off_size_multiplier=defaults.get("risk_off_size_multiplier", 0.50),
+        risk_off_score_raise=defaults.get("risk_off_score_raise", 0.0),
+        trades_table=defaults.get("trades_table", "ml_replay_trades"),
+        equity_table=defaults.get("equity_table", "ml_replay_equity"),
+        summary_table=defaults.get("summary_table", "ml_replay_summary"),
+        if_exists=defaults.get("if_exists", "replace"),
+        log_level=defaults.get("log_level", "INFO"),
+    )
+
+
+def instantiate_risk_manager(args: argparse.Namespace) -> RiskManager:
+    """Shared risk-manager constructor for replay and live strategy imports."""
+    return RiskManager(
+        {
+            "enabled": bool(args.enable_risk_manager),
+            "max_daily_loss_usd": args.max_daily_loss_usd,
+            "max_total_exposure_usd": args.max_total_exposure_usd,
+            "max_total_exposure_pct": args.max_total_exposure_pct,
+            "max_exposure_per_symbol_usd": args.max_exposure_per_symbol_usd,
+            "max_drawdown_pct": args.max_drawdown_pct,
+            "cooldown_minutes_per_symbol": args.cooldown_minutes_per_symbol,
+            "enable_drawdown_scaling": bool(args.enable_drawdown_scaling),
+            "drawdown_full_size_pct": args.drawdown_full_size_pct,
+            "drawdown_half_size_pct": args.drawdown_half_size_pct,
+            "drawdown_quarter_size_pct": args.drawdown_quarter_size_pct,
+            "drawdown_half_size_multiplier": args.drawdown_half_size_multiplier,
+            "drawdown_quarter_size_multiplier": args.drawdown_quarter_size_multiplier,
+            "close_positions_on_kill_switch": False,
+            "close_positions_on_daily_loss": False,
+            "close_positions_on_drawdown": False,
+        }
+    )
+
+
+def filter_ranked_candidates(
+    candidates: pd.DataFrame,
+    args: argparse.Namespace,
+    diagnostics: Optional[ReplayDiagnostics] = None,
+) -> pd.DataFrame:
+    """Shared candidate filtering/ranking path for replay and live strategy use.
+
+    Expected input:
+    - already enriched with `enrich_predictions(...)` or an equivalent live frame
+    - includes args.prob_column, entry_score, percentile/risk/regime columns
+    """
+    if candidates is None or candidates.empty:
+        return candidates.copy() if isinstance(candidates, pd.DataFrame) else pd.DataFrame()
+
+    out = candidates.copy()
+    prob_col = args.prob_column
+    vol_col = args.rolling_volatility_column
+    resolved_score_col = (
+        out["_resolved_score_col_name"].iloc[0]
+        if "_resolved_score_col_name" in out.columns and not out.empty
+        else prob_col
+    )
+    sym_col = args.symbol_column
+
+    if diagnostics is not None:
+        diagnostics.candidate_rows_seen += int(len(out))
+
+    out = out[out[prob_col] >= float(args.prob_threshold)].copy()
+    if diagnostics is not None:
+        diagnostics.candidate_rows_after_prob_threshold += int(len(out))
+
+    if not out.empty and float(args.min_prob_percentile) > 0.0:
+        out = out[
+            out["prob_percentile_rank"].notna()
+            & (out["prob_percentile_rank"] >= float(args.min_prob_percentile))
+        ].copy()
+    if diagnostics is not None:
+        diagnostics.candidate_rows_after_percentile += int(len(out))
+
+    if not out.empty and args.min_rolling_volatility_24h is not None:
+        out = out[
+            out[vol_col].notna() & (out[vol_col] >= float(args.min_rolling_volatility_24h))
+        ].copy()
+    if diagnostics is not None:
+        diagnostics.candidate_rows_after_volatility += int(len(out))
+
+    if not out.empty and args.max_predicted_time_to_peak_hours is not None:
+        out = out[
+            out["predicted_time_to_peak_hours"].notna()
+            & (out["predicted_time_to_peak_hours"] <= float(args.max_predicted_time_to_peak_hours))
+        ].copy()
+    if diagnostics is not None:
+        diagnostics.candidate_rows_after_time_to_peak += int(len(out))
+
+    if not out.empty and args.rank_score_min is not None:
+        out = out[out["entry_score"] >= float(args.rank_score_min)].copy()
+    if diagnostics is not None:
+        diagnostics.candidate_rows_after_rank_score += int(len(out))
+
+    out = apply_regime_gating(out, args, diagnostics)
+
+    if not out.empty:
+        out = out.sort_values(
+            ["entry_score", resolved_score_col, sym_col],
+            ascending=[False, False, True],
+        ).head(max(int(args.top_n), 0)).reset_index(drop=True)
+    return out
+
+
+def compute_entry_decision(
+    row: pd.Series,
+    *,
+    args: argparse.Namespace,
+    symbol: str,
+    entry_price: float,
+    cash: float,
+    risk_manager: Optional[RiskManager] = None,
+) -> Optional[dict]:
+    """Shared entry-sizing decision for replay and live strategy imports."""
+    prob_mult, vol_mult, kelly_fraction, kelly_mult, total_mult = compute_size_multipliers(row, args)
+
+    regime_size_multiplier = 1.0
+    if args.enable_regime_gating and args.regime_gating_mode == "scale":
+        regime_size_multiplier = float(row.get("_regime_size_multiplier", 1.0) or 1.0)
+
+    target_notional = float(args.notional_per_trade) * total_mult * regime_size_multiplier
+
+    drawdown_size_multiplier = 1.0
+    if risk_manager is not None:
+        drawdown_size_multiplier = float(risk_manager.get_position_size_multiplier())
+        if drawdown_size_multiplier <= 0.0:
+            return None
+
+    target_notional *= drawdown_size_multiplier
+    if target_notional < float(args.min_notional_per_trade):
+        return None
+    if cash < target_notional:
+        return None
+    if entry_price <= 0.0:
+        return None
+
+    if risk_manager is not None:
+        allowed, _ = risk_manager.can_enter_trade(symbol, target_notional)
+        if not allowed:
+            return None
+
+    quantity = float(target_notional / entry_price)
+    return {
+        "symbol": symbol,
+        "entry_price": float(entry_price),
+        "quantity": quantity,
+        "target_notional": float(target_notional),
+        "prob_size_multiplier": float(prob_mult),
+        "vol_size_multiplier": float(vol_mult),
+        "kelly_fraction": float(kelly_fraction),
+        "kelly_multiplier": float(kelly_mult),
+        "regime_size_multiplier": float(regime_size_multiplier),
+        "drawdown_size_multiplier": float(drawdown_size_multiplier),
+        "total_size_multiplier": float(total_mult),
+    }
+
+
+
 def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     ts_col = args.timestamp_column
     sym_col = args.symbol_column
@@ -929,47 +1179,28 @@ def replay_strategy(predictions: pd.DataFrame, prices: pd.DataFrame, args: argpa
                         diagnostics.skipped_missing_price += 1
                         continue
 
-                    prob_mult, vol_mult, kelly_fraction, kelly_mult, total_mult = compute_size_multipliers(row, args)
-
-                    regime_size_multiplier = 1.0
-                    if args.enable_regime_gating and args.regime_gating_mode == "scale":
-                        regime_size_multiplier = float(row.get("_regime_size_multiplier", 1.0) or 1.0)
-                        if regime_size_multiplier != 1.0:
-                            diagnostics.regime_scale_events += 0  # counted during candidate gating
-
-                    target_notional = float(args.notional_per_trade) * total_mult * regime_size_multiplier
-
-                    drawdown_size_multiplier = risk_manager.get_position_size_multiplier()
-                    if drawdown_size_multiplier <= 0.0:
-                        LOGGER.debug(
-                            "Risk manager blocked entry due to drawdown throttle: ts=%s symbol=%s",
-                            ts,
-                            symbol,
-                        )
-                        continue
-
-                    target_notional *= drawdown_size_multiplier
-
-                    if target_notional < float(args.min_notional_per_trade):
-                        diagnostics.sized_below_min_notional += 1
-                        continue
-                    if cash < target_notional:
-                        diagnostics.skipped_cash += 1
-                        continue
-
-                    allowed, risk_reason = risk_manager.can_enter_trade(symbol, target_notional)
-                    if not allowed:
-                        LOGGER.debug(
-                            "Risk manager blocked entry: ts=%s symbol=%s notional=%.2f reason=%s",
-                            ts,
-                            symbol,
-                            target_notional,
-                            risk_reason,
-                        )
-                        continue
-
                     entry_price = current_prices[symbol]
-                    quantity = target_notional / entry_price
+                    decision = compute_entry_decision(
+                        row,
+                        args=args,
+                        symbol=symbol,
+                        entry_price=entry_price,
+                        cash=cash,
+                        risk_manager=risk_manager,
+                    )
+                    if decision is None:
+                        if cash < float(args.notional_per_trade):
+                            diagnostics.skipped_cash += 1
+                        continue
+
+                    prob_mult = decision["prob_size_multiplier"]
+                    vol_mult = decision["vol_size_multiplier"]
+                    kelly_fraction = decision["kelly_fraction"]
+                    kelly_mult = decision["kelly_multiplier"]
+                    total_mult = decision["total_size_multiplier"]
+                    regime_size_multiplier = decision["regime_size_multiplier"]
+                    target_notional = decision["target_notional"]
+                    quantity = decision["quantity"]
                     open_positions[symbol] = Position(
                         symbol=symbol,
                         entry_timestamp=ts,
@@ -1285,6 +1516,25 @@ def run_replay(args: argparse.Namespace) -> tuple[pd.DataFrame, pd.DataFrame, pd
     finally:
         conn.close()
 
+
+
+__all__ = [
+    "build_runtime_args",
+    "instantiate_risk_manager",
+    "resolve_prediction_columns",
+    "load_predictions",
+    "load_prices",
+    "load_context",
+    "enrich_predictions",
+    "compute_kelly_terms",
+    "compute_size_multipliers",
+    "filter_ranked_candidates",
+    "compute_entry_decision",
+    "apply_regime_gating",
+    "_compute_dynamic_position_limit",
+    "replay_strategy",
+    "run_replay",
+]
 
 def main() -> int:
     args = parse_args()

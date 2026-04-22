@@ -5,6 +5,8 @@ import httpx
 from typing import Any, Dict, Set
 
 import yaml
+import pandas as pd
+import warnings
 
 from tradarbot.app.context import Ctx
 from tradarbot.core.bus import EventBus
@@ -20,7 +22,15 @@ from tradarbot.risk.risk_manager import RiskManager
 from tradarbot.storage.sqlite_store import SQLiteStore
 from tradarbot.strategies.algo2_micro_momentum import Algo2MicroMomentum
 from tradarbot.strategies.algo1_new_listing_pump import Algo1NewListingPump
+from tradarbot.strategies.ml_strategy import MLStrategy
 
+
+pd.set_option('future.no_silent_downcasting', True)
+warnings.filterwarnings(
+    "ignore",
+    message="Downcasting object dtype arrays on .fillna",
+    category=FutureWarning,
+)
 
 def setup_logging(level: str) -> None:
     numeric = getattr(logging, level.upper(), logging.INFO)
@@ -71,6 +81,12 @@ async def main() -> None:
     algo2_cfg = cfg.get("strategies", {}).get("algo2_micro_momentum", {})
     if algo2_cfg.get("enabled", False):
         strategies.append(Algo2MicroMomentum(algo2_cfg))
+    
+    ml_cfg = cfg.get("ml_live", {})
+    if ml_cfg.get("enabled", False):
+        strategies.append(MLStrategy(ml_cfg))
+
+    log.info("loaded strategies=%s", [s.name for s in strategies])
 
     engine = StrategyEngine(strategies=strategies, risk=risk, broker=broker, ctx=ctx)
 

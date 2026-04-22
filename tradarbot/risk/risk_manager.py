@@ -21,37 +21,53 @@ class RiskSnapshot:
 
 class RiskManager:
     """
-    Deterministic replay/live risk layer.
+    Hybrid replay/live risk layer.
 
-    Phase 4.6 / 4.6.1 features:
-    - daily loss cap
-    - total exposure cap
-    - per-symbol exposure cap
-    - cooldown by symbol
-    - hard drawdown stop / kill switch
-    - optional drawdown-based position scaling
+    Replay-compatible API:
+    - set_timestamp
+    - update_realized_pnl
+    - update_equity
+    - update_positions
+    - current_drawdown_pct
+    - current_daily_pnl
+    - register_exit / mark_position_exit
+    - activate_kill_switch
+    - get_position_size_multiplier
+    - can_enter_trade
+    - should_force_exit
+    - snapshot
+    - summary_metrics
 
-    Drawdown scaling regime:
-    - below full-size threshold: 100%
-    - full-size threshold to half-size threshold: 100%
-    - half-size threshold to quarter-size threshold: configurable reduced size
-    - quarter-size threshold to hard-stop threshold: configurable reduced size
-    - at or above hard-stop threshold: 0% / block entries
+    Live-compatible API:
+    - check(intent, ctx, strat_name)
     """
 
     def __init__(self, config: Dict[str, Any]):
-        self.config = dict(config or {})
-        self.enabled = bool(self.config.get("enabled", False))
+        raw = dict(config or {})
+        self.root_config = raw
+
+        # Support either full app config or flat risk config.
+        risk_block = dict(raw.get("risk", {})) if isinstance(raw.get("risk"), dict) else {}
+        ml_live_block = dict(raw.get("ml_live", {})) if isinstance(raw.get("ml_live"), dict) else {}
+        ml_replay_block = dict(raw.get("ml_replay", {})) if isinstance(raw.get("ml_replay"), dict) else {}
+
+        merged: Dict[str, Any] = {}
+        merged.update(ml_replay_block)
+        merged.update(ml_live_block)
+        merged.update(risk_block)
+        if not merged:
+            merged = raw
+
+        self.config = merged
+        self.enabled = bool(self.config.get("enabled", True))
 
         self.max_daily_loss_usd = self._opt_float("max_daily_loss_usd")
         self.max_total_exposure_usd = self._opt_float("max_total_exposure_usd")
         self.max_total_exposure_pct = self._opt_float("max_total_exposure_pct")
         self.max_exposure_per_symbol_usd = self._opt_float("max_exposure_per_symbol_usd")
         self.max_drawdown_pct = self._opt_float("max_drawdown_pct")
-        self.cooldown_minutes_per_symbol = float(
-            self.config.get("cooldown_minutes_per_symbol", 0.0) or 0.0
-        )
-
+        self.cooldown_minutes_per_symbol = float(self.config.get("cooldown_minutes_per_symbol", 0.0) or 0.0)
+        self.cooldown_until_by_symbol: Dict[str, pd.Timestamp] = {}
         self.enable_drawdown_scaling = bool(self.config.get("enable_drawdown_scaling", False))
         self.drawdown_full_size_pct = float(self.config.get("drawdown_full_size_pct", 0.04) or 0.04)
         self.drawdown_half_size_pct = float(self.config.get("drawdown_half_size_pct", 0.06) or 0.06)
@@ -72,6 +88,9 @@ class RiskManager:
         self.close_positions_on_drawdown = bool(
             self.config.get("close_positions_on_drawdown", False)
         )
+
+        self.max_positions = self._opt_int("max_positions")
+        self.min_notional_per_trade = float(self.config.get("min_notional_per_trade", 0.0) or 0.0)
 
         self.current_timestamp: Optional[pd.Timestamp] = None
         self.current_day = None
@@ -107,6 +126,14 @@ class RiskManager:
     def _opt_float(self, key: str) -> Optional[float]:
         value = self.config.get(key)
         return None if value is None else float(value)
+
+    def _opt_int(self, key: str) -> Optional[int]:
+        value = self.config.get(key)
+        return None if value is None else int(value)
+
+    # ------------------------------------------------------------------
+    # Replay-compatible API
+    # ------------------------------------------------------------------
 
     def set_timestamp(self, timestamp: Optional[pd.Timestamp]) -> None:
         if timestamp is None:
@@ -145,38 +172,82 @@ class RiskManager:
 
     def update_positions(
         self,
-        positions: Dict[str, Any],
+        positions: Optional[Dict[str, Any]] = None,
         mark_prices: Optional[Dict[str, float]] = None,
+        *,
+        exposure_by_symbol: Optional[Dict[str, float]] = None,
+        total_exposure: Optional[float] = None,
+        unrealized_pnl_total: Optional[float] = None,
     ) -> None:
-        mark_prices = mark_prices or {}
-        exposure_by_symbol: Dict[str, float] = {}
+        # Replay-style positional API:
+        if positions is not None:
+            mark_prices = mark_prices or {}
+            computed_exposure_by_symbol: Dict[str, float] = {}
 
-        for symbol, pos in positions.items():
-            mark_price = float(mark_prices.get(symbol, getattr(pos, "entry_price", 0.0) or 0.0))
-            quantity = float(getattr(pos, "quantity", 0.0) or 0.0)
-            fallback_notional = float(getattr(pos, "notional_usd", 0.0) or 0.0)
+            for symbol, pos in dict(positions).items():
+                current_price = mark_prices.get(symbol)
 
-            exposure = quantity * mark_price if mark_price > 0.0 and quantity > 0.0 else fallback_notional
-            exposure_by_symbol[str(symbol)] = max(0.0, float(exposure))
+                if isinstance(pos, dict):
+                    qty = float(pos.get("quantity", pos.get("qty", 0.0)) or 0.0)
+                    entry_price = pos.get("entry_price", pos.get("avg_px"))
+                    fallback_notional = float(pos.get("notional_usd", 0.0) or 0.0)
+                else:
+                    qty = float(getattr(pos, "quantity", getattr(pos, "qty", 0.0)) or 0.0)
+                    entry_price = getattr(pos, "entry_price", getattr(pos, "avg_px", None))
+                    fallback_notional = float(getattr(pos, "notional_usd", 0.0) or 0.0)
 
-        self.exposure_by_symbol = exposure_by_symbol
-        self.total_exposure = float(sum(exposure_by_symbol.values()))
-        self.unrealized_pnl_total = float(
-            sum(
-                float(getattr(pos, "quantity", 0.0) or 0.0)
-                * (
-                    float(mark_prices.get(symbol, getattr(pos, "entry_price", 0.0) or 0.0))
-                    - float(getattr(pos, "entry_price", 0.0) or 0.0)
-                )
-                for symbol, pos in positions.items()
-            )
-        )
+                if current_price is None:
+                    current_price = entry_price
+
+                exposure = 0.0
+                if current_price is not None and qty > 0.0:
+                    exposure = qty * float(current_price)
+                else:
+                    exposure = fallback_notional
+
+                computed_exposure_by_symbol[str(symbol)] = max(0.0, float(exposure))
+
+            self.exposure_by_symbol = computed_exposure_by_symbol
+            self.total_exposure = float(sum(computed_exposure_by_symbol.values()))
+
+            unrealized_total = 0.0
+            for symbol, pos in dict(positions).items():
+                current_price = mark_prices.get(symbol)
+                if isinstance(pos, dict):
+                    qty = float(pos.get("quantity", pos.get("qty", 0.0)) or 0.0)
+                    entry_price = pos.get("entry_price", pos.get("avg_px"))
+                else:
+                    qty = float(getattr(pos, "quantity", getattr(pos, "qty", 0.0)) or 0.0)
+                    entry_price = getattr(pos, "entry_price", getattr(pos, "avg_px", None))
+
+                if qty <= 0.0 or current_price is None or entry_price is None:
+                    continue
+                unrealized_total += qty * (float(current_price) - float(entry_price))
+
+            self.unrealized_pnl_total = float(unrealized_total)
+            self._refresh_triggers()
+            return
+
+        # Live-style keyword API:
+        if exposure_by_symbol is not None:
+            self.exposure_by_symbol = {
+                str(symbol): float(value) for symbol, value in exposure_by_symbol.items()
+            }
+        if total_exposure is not None:
+            self.total_exposure = float(total_exposure)
+        else:
+            self.total_exposure = float(sum(self.exposure_by_symbol.values()))
+        if unrealized_pnl_total is not None:
+            self.unrealized_pnl_total = float(unrealized_pnl_total)
         self._refresh_triggers()
 
     def current_drawdown_pct(self) -> float:
         if self.peak_equity <= 0.0:
             return 0.0
         return max(0.0, (self.peak_equity - self.current_equity) / self.peak_equity)
+
+    def get_drawdown_pct(self) -> float:
+        return self.current_drawdown_pct()
 
     def current_daily_pnl(self) -> float:
         return float(self.realized_pnl_today + self.unrealized_pnl_total)
@@ -194,6 +265,9 @@ class RiskManager:
         if forced:
             self.forced_exits_count += 1
 
+    def mark_position_exit(self, symbol: str, timestamp: Optional[pd.Timestamp] = None) -> None:
+        self.register_exit(symbol=symbol, timestamp=timestamp, forced=False)
+
     def activate_kill_switch(self, reason: str = "manual") -> None:
         _ = reason
         if not self.kill_switch_triggered:
@@ -202,16 +276,7 @@ class RiskManager:
         self.safe_mode = True
 
     def get_position_size_multiplier(self) -> float:
-        """
-        Returns the drawdown throttle multiplier to apply to a proposed entry size.
-
-        Example default regime:
-        0–4% drawdown   -> 1.00
-        4–6% drawdown   -> 0.50
-        6–8% drawdown   -> 0.25
-        >=8% drawdown   -> 0.00
-        """
-        if not self.enabled or not self.enable_drawdown_scaling:
+        if not self.enabled:
             return 1.0
 
         dd = self.current_drawdown_pct()
@@ -219,7 +284,13 @@ class RiskManager:
         if hard_stop is None:
             hard_stop = self.drawdown_quarter_size_pct
 
-        if dd >= hard_stop:
+        if not self.enable_drawdown_scaling:
+            if hard_stop is not None and dd >= hard_stop:
+                self.drawdown_scaling_stop_count += 1
+                return 0.0
+            return 1.0
+
+        if hard_stop is not None and dd >= hard_stop:
             self.drawdown_scaling_stop_count += 1
             return 0.0
         if dd >= self.drawdown_half_size_pct:
@@ -260,20 +331,20 @@ class RiskManager:
             if (current_symbol_exposure + proposed_notional) > self.max_exposure_per_symbol_usd:
                 self.exposure_violations_count += 1
                 self.trades_blocked_by_risk_count += 1
-                return False, "per_symbol_exposure_limit"
+                return False, "max_exposure_per_symbol_usd"
 
         if self.max_total_exposure_usd is not None:
             if (self.total_exposure + proposed_notional) > self.max_total_exposure_usd:
                 self.exposure_violations_count += 1
                 self.trades_blocked_by_risk_count += 1
-                return False, "total_exposure_limit_usd"
+                return False, "max_total_exposure_usd"
 
         if self.max_total_exposure_pct is not None and self.current_equity > 0.0:
             next_exposure_pct = (self.total_exposure + proposed_notional) / self.current_equity
             if next_exposure_pct > self.max_total_exposure_pct:
                 self.exposure_violations_count += 1
                 self.trades_blocked_by_risk_count += 1
-                return False, "total_exposure_limit_pct"
+                return False, "max_total_exposure_pct"
 
         return True, "approved"
 
@@ -321,7 +392,82 @@ class RiskManager:
             "drawdown_scaling_stop_count": float(self.drawdown_scaling_stop_count),
         }
 
+    # ------------------------------------------------------------------
+    # Live-engine API
+    # ------------------------------------------------------------------
+
+    def check(self, intent, ctx, strat_name: Optional[str] = None) -> Dict[str, Any]:
+        if intent is None:
+            return {"approved": False, "intent": intent, "reason": "missing_intent"}
+
+        self._refresh_from_ctx(ctx)
+
+        side = str(getattr(intent, "side", "")).upper()
+        symbol = str(getattr(intent, "symbol", ""))
+        qty = float(getattr(intent, "qty", 0.0) or 0.0)
+        limit_px = float(getattr(intent, "limit_px", 0.0) or 0.0)
+
+        if not symbol:
+            return {"approved": False, "intent": intent, "reason": "missing_symbol"}
+        if qty <= 0.0:
+            return {"approved": False, "intent": intent, "reason": "non_positive_qty"}
+        if limit_px <= 0.0:
+            return {"approved": False, "intent": intent, "reason": "non_positive_limit_px"}
+
+        # Always allow exits through.
+        if side == "SELL":
+            return {"approved": True, "intent": intent, "reason": None}
+
+        if self.max_positions is not None:
+            broker = getattr(ctx, "broker", None)
+            positions = getattr(broker, "positions", {}) if broker is not None else {}
+            open_count = 0
+            for _, pos in dict(positions or {}).items():
+                qty_val = float(getattr(pos, "qty", getattr(pos, "quantity", 0.0)) or 0.0)
+                if qty_val > 0.0:
+                    open_count += 1
+
+            already_open = False
+            if broker is not None and hasattr(broker, "positions"):
+                pos = broker.positions.get(symbol)
+                if pos is not None:
+                    already_open = bool(
+                        float(getattr(pos, "qty", getattr(pos, "quantity", 0.0)) or 0.0) > 0.0
+                    )
+
+            if open_count >= int(self.max_positions) and not already_open:
+                self.trades_blocked_by_risk_count += 1
+                return {"approved": False, "intent": intent, "reason": "max_positions"}
+
+        proposed_notional = qty * limit_px
+        if proposed_notional < self.min_notional_per_trade:
+            self.trades_blocked_by_risk_count += 1
+            return {"approved": False, "intent": intent, "reason": "min_notional_per_trade"}
+
+        broker = getattr(ctx, "broker", None)
+        cash = float(getattr(broker, "cash", 0.0) or 0.0) if broker is not None else 0.0
+        if cash > 0.0 and proposed_notional > cash:
+            self.trades_blocked_by_risk_count += 1
+            return {"approved": False, "intent": intent, "reason": "insufficient_cash"}
+
+        allowed, reason = self.can_enter_trade(symbol, proposed_notional)
+        if not allowed:
+            return {"approved": False, "intent": intent, "reason": reason}
+
+        return {"approved": True, "intent": intent, "reason": None}
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _cooldown_breached(self, symbol: str) -> bool:
+        symbol = str(symbol)
+
+        if self.current_timestamp is not None:
+            direct_until = self.cooldown_until_by_symbol.get(symbol)
+            if direct_until is not None and self.current_timestamp < direct_until:
+                return True
+
         if self.cooldown_minutes_per_symbol <= 0.0:
             return False
         if self.current_timestamp is None:
@@ -333,6 +479,25 @@ class RiskManager:
 
         elapsed_minutes = (self.current_timestamp - last_exit).total_seconds() / 60.0
         return elapsed_minutes < self.cooldown_minutes_per_symbol
+     
+    def set_cooldown(self, symbol: str, cooldown_s: int) -> None:
+        if cooldown_s is None or int(cooldown_s) <= 0:
+            return
+
+        now = self.current_timestamp
+        if now is None:
+            now = pd.Timestamp.utcnow()
+            if now.tzinfo is None:
+                now = now.tz_localize("UTC")
+            else:
+                now = now.tz_convert("UTC")
+            self.current_timestamp = now
+
+        self.cooldown_until_by_symbol[str(symbol)] = now + pd.Timedelta(seconds=int(cooldown_s))
+
+
+    def clear_cooldown(self, symbol: str) -> None:
+        self.cooldown_until_by_symbol.pop(str(symbol), None)
 
     def _daily_loss_breached(self) -> bool:
         if self.max_daily_loss_usd is None:
@@ -348,12 +513,115 @@ class RiskManager:
         if not self.enabled:
             return
 
-        if self._daily_loss_breached() and not self._daily_loss_active:
-            self._daily_loss_active = True
-            self.daily_loss_triggered_count += 1
+        if self._daily_loss_breached():
+            if not self._daily_loss_active:
+                self._daily_loss_active = True
+                self.daily_loss_triggered_count += 1
             self.safe_mode = True
+        else:
+            self._daily_loss_active = False
 
-        if self._drawdown_breached() and not self._drawdown_breach_active:
-            self._drawdown_breach_active = True
-            self.drawdown_breach_count += 1
-            self.activate_kill_switch("drawdown_limit")
+        if self._drawdown_breached():
+            if not self._drawdown_breach_active:
+                self._drawdown_breach_active = True
+                self.drawdown_breach_count += 1
+                self.activate_kill_switch("drawdown_limit")
+        else:
+            self._drawdown_breach_active = False
+
+    def _refresh_from_ctx(self, ctx) -> None:
+        if ctx is None:
+            return
+
+        state = getattr(ctx, "state", None)
+        broker = getattr(ctx, "broker", None)
+
+        ts_ms = getattr(state, "current_event_ts_ms", None) if state is not None else None
+        if ts_ms is not None:
+            try:
+                self.set_timestamp(pd.to_datetime(int(ts_ms), unit="ms", utc=True))
+            except Exception:
+                pass
+
+        if broker is not None:
+            equity = self._infer_current_equity(broker)
+            if equity is not None:
+                self.update_equity(equity)
+
+            inferred_exposure = self._infer_exposure_by_symbol(broker)
+            inferred_total_exposure = sum(inferred_exposure.values())
+            inferred_unrealized = self._infer_unrealized_pnl(broker)
+            self.update_positions(
+                exposure_by_symbol=inferred_exposure,
+                total_exposure=inferred_total_exposure,
+                unrealized_pnl_total=inferred_unrealized,
+            )
+
+    def _infer_current_equity(self, broker) -> Optional[float]:
+        for attr in ("equity", "account_equity", "current_equity"):
+            value = getattr(broker, attr, None)
+            if value is not None:
+                try:
+                    return float(value)
+                except Exception:
+                    pass
+
+        cash = float(getattr(broker, "cash", 0.0) or 0.0)
+        mtm_value = 0.0
+        positions = getattr(broker, "positions", {}) or {}
+        for _, pos in dict(positions).items():
+            qty = float(getattr(pos, "qty", getattr(pos, "quantity", 0.0)) or 0.0)
+            if qty <= 0.0:
+                continue
+
+            price = None
+            for attr in ("current_price", "avg_px", "entry_price", "mark_price", "last_price"):
+                val = getattr(pos, attr, None)
+                if val is not None:
+                    try:
+                        price = float(val)
+                        break
+                    except Exception:
+                        pass
+            if price is None:
+                continue
+            mtm_value += qty * price
+
+        return cash + mtm_value
+
+    def _infer_exposure_by_symbol(self, broker) -> Dict[str, float]:
+        exposures: Dict[str, float] = {}
+        positions = getattr(broker, "positions", {}) or {}
+        for symbol, pos in dict(positions).items():
+            qty = float(getattr(pos, "qty", getattr(pos, "quantity", 0.0)) or 0.0)
+            if qty <= 0.0:
+                continue
+
+            price = None
+            for attr in ("current_price", "avg_px", "entry_price", "mark_price", "last_price"):
+                val = getattr(pos, attr, None)
+                if val is not None:
+                    try:
+                        price = float(val)
+                        break
+                    except Exception:
+                        pass
+            if price is None:
+                continue
+
+            exposures[str(symbol)] = qty * price
+        return exposures
+
+    def _infer_unrealized_pnl(self, broker) -> float:
+        total = 0.0
+        positions = getattr(broker, "positions", {}) or {}
+        for _, pos in dict(positions).items():
+            for attr in ("unrealized_pnl", "unrealized_pnl_usd"):
+                val = getattr(pos, attr, None)
+                if val is not None:
+                    try:
+                        total += float(val)
+                        break
+                    except Exception:
+                        pass
+        return total
