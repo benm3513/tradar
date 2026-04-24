@@ -52,3 +52,4 @@ backtests/
 *.db-wal
 *.db-shm
 *.db
+config/*.phase5_*

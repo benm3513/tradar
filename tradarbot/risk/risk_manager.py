@@ -398,7 +398,7 @@ class RiskManager:
 
     def check(self, intent, ctx, strat_name: Optional[str] = None) -> Dict[str, Any]:
         if intent is None:
-            return {"approved": False, "intent": intent, "reason": "missing_intent"}
+            return {"approved": False, "intent": intent, "reason": "missing_intent", "reason_category": "validation", "strat_name": strat_name}
 
         self._refresh_from_ctx(ctx)
 
@@ -406,17 +406,20 @@ class RiskManager:
         symbol = str(getattr(intent, "symbol", ""))
         qty = float(getattr(intent, "qty", 0.0) or 0.0)
         limit_px = float(getattr(intent, "limit_px", 0.0) or 0.0)
+        tif = str(getattr(intent, "tif", "IOC") or "IOC").upper()
 
         if not symbol:
-            return {"approved": False, "intent": intent, "reason": "missing_symbol"}
+            return {"approved": False, "intent": intent, "reason": "missing_symbol", "reason_category": "validation", "strat_name": strat_name}
         if qty <= 0.0:
-            return {"approved": False, "intent": intent, "reason": "non_positive_qty"}
+            return {"approved": False, "intent": intent, "reason": "non_positive_qty", "reason_category": "validation", "strat_name": strat_name}
         if limit_px <= 0.0:
-            return {"approved": False, "intent": intent, "reason": "non_positive_limit_px"}
+            return {"approved": False, "intent": intent, "reason": "non_positive_limit_px", "reason_category": "validation", "strat_name": strat_name}
+        if tif not in {"IOC", "GTC", "FOK", "MARKET"}:
+            return {"approved": False, "intent": intent, "reason": "unsupported_tif", "reason_category": "validation", "strat_name": strat_name}
 
         # Always allow exits through.
         if side == "SELL":
-            return {"approved": True, "intent": intent, "reason": None}
+            return {"approved": True, "intent": intent, "reason": None, "reason_category": None, "strat_name": strat_name}
 
         if self.max_positions is not None:
             broker = getattr(ctx, "broker", None)
@@ -437,24 +440,24 @@ class RiskManager:
 
             if open_count >= int(self.max_positions) and not already_open:
                 self.trades_blocked_by_risk_count += 1
-                return {"approved": False, "intent": intent, "reason": "max_positions"}
+                return {"approved": False, "intent": intent, "reason": "max_positions", "reason_category": "exposure", "strat_name": strat_name}
 
         proposed_notional = qty * limit_px
         if proposed_notional < self.min_notional_per_trade:
             self.trades_blocked_by_risk_count += 1
-            return {"approved": False, "intent": intent, "reason": "min_notional_per_trade"}
+            return {"approved": False, "intent": intent, "reason": "min_notional_per_trade", "reason_category": "validation", "strat_name": strat_name}
 
         broker = getattr(ctx, "broker", None)
         cash = float(getattr(broker, "cash", 0.0) or 0.0) if broker is not None else 0.0
         if cash > 0.0 and proposed_notional > cash:
             self.trades_blocked_by_risk_count += 1
-            return {"approved": False, "intent": intent, "reason": "insufficient_cash"}
+            return {"approved": False, "intent": intent, "reason": "insufficient_cash", "reason_category": "capital", "strat_name": strat_name}
 
         allowed, reason = self.can_enter_trade(symbol, proposed_notional)
         if not allowed:
-            return {"approved": False, "intent": intent, "reason": reason}
+            return {"approved": False, "intent": intent, "reason": reason, "reason_category": self._reason_category(reason), "strat_name": strat_name}
 
-        return {"approved": True, "intent": intent, "reason": None}
+        return {"approved": True, "intent": intent, "reason": None, "reason_category": None, "strat_name": strat_name}
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -509,6 +512,20 @@ class RiskManager:
             return False
         return self.current_drawdown_pct() >= self.max_drawdown_pct
 
+
+    @staticmethod
+    def _reason_category(reason: Optional[str]) -> Optional[str]:
+        if reason is None:
+            return None
+        if reason in {"max_exposure_per_symbol_usd", "max_total_exposure_usd", "max_total_exposure_pct", "max_positions"}:
+            return "exposure"
+        if reason in {"daily_loss_limit", "drawdown_limit", "kill_switch_active", "symbol_cooldown"}:
+            return "risk"
+        if reason in {"min_notional_per_trade", "missing_symbol", "non_positive_qty", "non_positive_limit_px", "unsupported_tif"}:
+            return "validation"
+        if reason in {"insufficient_cash"}:
+            return "capital"
+        return "other"
     def _refresh_triggers(self) -> None:
         if not self.enabled:
             return

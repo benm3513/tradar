@@ -11,13 +11,14 @@ import warnings
 from tradarbot.app.context import Ctx
 from tradarbot.core.bus import EventBus
 from tradarbot.core.engine import StrategyEngine
-from tradarbot.core.events import CandleEvent, ListingEvent, BookEvent
+from tradarbot.core.events import CandleEvent, ListingEvent, BookEvent, OrderIntent
 from tradarbot.core.state import State
 from tradarbot.data.candles import CandleBuilder1s
 from tradarbot.data.symbol_registry import SymbolRegistry
 from tradarbot.exchange.binance.rest import BinanceRestClient
 from tradarbot.exchange.binance.ws_manager import BinanceWSManager
 from tradarbot.execution.paper_broker import PaperBroker
+from tradarbot.execution.live_broker import LiveBroker
 from tradarbot.risk.risk_manager import RiskManager
 from tradarbot.storage.sqlite_store import SQLiteStore
 from tradarbot.strategies.algo2_micro_momentum import Algo2MicroMomentum
@@ -52,10 +53,15 @@ async def main() -> None:
     store = SQLiteStore("tradarbot.db")
     store.init_schema()
 
-    broker = PaperBroker(
-        fee_bps=float(cfg["execution"]["fee_bps"]),
-        starting_cash=10_000.0
-    )
+    exec_live_cfg = cfg.get("execution_live", {})
+    broker_mode = str(exec_live_cfg.get("broker", "paper") or "paper").lower()
+    if bool(exec_live_cfg.get("enabled", False)) and broker_mode in {"live", "dry_run_live", "dry-run-live", "dryrun"}:
+        broker = LiveBroker(cfg=cfg, store=store, starting_cash=float(exec_live_cfg.get("starting_cash", 0.0) or 0.0))
+    else:
+        broker = PaperBroker(
+            fee_bps=float(cfg["execution"]["fee_bps"]),
+            starting_cash=float(exec_live_cfg.get("starting_cash", 10_000.0) or 10_000.0),
+        )
     risk = RiskManager(cfg)
 
     ctx = Ctx(cfg=cfg, state=state, store=store, broker=broker, risk=risk)
@@ -131,7 +137,13 @@ async def main() -> None:
     symbol_registry = SymbolRegistry(rest=rest, cfg=registry_cfg, bus=bus)
 
 
+    force_cfg = cfg.get("execution_live", {})
+    forced_test_order_sent = False
+    forced_test_entry_ts_s = None
+    forced_test_exit_sent = False
+
     async def rest_poll_loop():
+        nonlocal forced_test_order_sent, forced_test_entry_ts_s, forced_test_exit_sent
         interval = float(cfg.get("rest_poll", {}).get("interval_s", 0.5))
         endpoint = cfg.get("rest_poll", {}).get("endpoint", "ticker_book")
         symbols: Set[str] = set()
@@ -175,6 +187,82 @@ async def main() -> None:
                     be = BookEvent(symbol=s, ts_ms=ts_ms, bid=bid, ask=ask)
                     _on_book(ctx, candle_builder, be)
                     ctx.state._poll_ok += 1
+
+                    if bool(force_cfg.get("force_test_order_enabled", False)) and not forced_test_order_sent:
+                        test_symbol = str(force_cfg.get("force_test_order_symbol", "ETHUSDT") or "ETHUSDT")
+                        if s == test_symbol:
+                            ms = ctx.state.market.get(test_symbol)
+                            if ms and ms.bid is not None and ms.ask is not None:
+                                forced_test_order_sent = True
+                                qty = float(force_cfg.get("force_test_order_qty", 0.001) or 0.001)
+                                premium_bps = float(force_cfg.get("force_test_order_premium_bps", 10.0) or 10.0)
+                                limit_px = float(ms.ask) * (1.0 + premium_bps / 10000.0)
+                                test_intent = OrderIntent(
+                                    side="BUY",
+                                    symbol=test_symbol,
+                                    qty=qty,
+                                    limit_px=limit_px,
+                                    tif=str(force_cfg.get("default_tif", "IOC") or "IOC"),
+                                )
+                                log.info(
+                                    "FORCE TEST ORDER routing_through_engine symbol=%s qty=%.8f limit_px=%.8f premium_bps=%.2f tif=%s",
+                                    test_symbol,
+                                    qty,
+                                    limit_px,
+                                    premium_bps,
+                                    test_intent.tif,
+                                )
+                                engine._handle_strategy_outputs([test_intent], "force_test_order", trigger_event=be)
+                                forced_test_entry_ts_s = time.time()
+
+                    if (
+                        bool(force_cfg.get("force_test_auto_exit_enabled", False))
+                        and forced_test_order_sent
+                        and not forced_test_exit_sent
+                        and forced_test_entry_ts_s is not None
+                    ):
+                        exit_delay_s = float(force_cfg.get("force_test_auto_exit_delay_s", 15.0) or 15.0)
+                        if time.time() - float(forced_test_entry_ts_s) >= exit_delay_s:
+                            test_symbol = str(force_cfg.get("force_test_order_symbol", "ETHUSDT") or "ETHUSDT")
+                            venue_symbol = test_symbol
+                            router = getattr(broker, "router", None)
+                            if router is not None and hasattr(router, "to_venue_symbol"):
+                                try:
+                                    venue_symbol = router.to_venue_symbol(test_symbol)
+                                except Exception:
+                                    venue_symbol = test_symbol
+
+                            positions = getattr(broker, "positions", {}) or {}
+                            pos = positions.get(venue_symbol) or positions.get(test_symbol)
+                            pos_qty = float(getattr(pos, "qty", 0.0) or 0.0) if pos is not None else 0.0
+                            if pos_qty > 0.0:
+                                ms = ctx.state.market.get(test_symbol)
+                                if ms and ms.bid is not None and ms.bid > 0:
+                                    exit_discount_bps = float(
+                                        force_cfg.get(
+                                            "force_test_auto_exit_discount_bps",
+                                            force_cfg.get("force_test_order_premium_bps", 10.0),
+                                        ) or 10.0
+                                    )
+                                    exit_limit_px = float(ms.bid) * (1.0 - exit_discount_bps / 10_000.0)
+                                    forced_test_exit_sent = True
+                                    exit_intent = OrderIntent(
+                                        side="SELL",
+                                        symbol=venue_symbol,
+                                        qty=pos_qty,
+                                        limit_px=exit_limit_px,
+                                        tif=str(force_cfg.get("default_tif", "IOC") or "IOC"),
+                                    )
+                                    log.info(
+                                        "FORCE TEST AUTO EXIT routing_through_engine source_symbol=%s venue_symbol=%s qty=%.8f limit_px=%.8f discount_bps=%.2f tif=%s",
+                                        test_symbol,
+                                        venue_symbol,
+                                        pos_qty,
+                                        exit_limit_px,
+                                        exit_discount_bps,
+                                        exit_intent.tif,
+                                    )
+                                    engine._handle_strategy_outputs([exit_intent], "force_test_auto_exit", trigger_event=be)
 
                 except httpx.HTTPStatusError as e:
                     ctx.state._poll_err += 1
