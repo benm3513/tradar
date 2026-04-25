@@ -7,6 +7,8 @@ from typing import Any, Dict, Iterable, Optional
 
 import pandas as pd
 
+from tradarbot.ml.live_regime import compute_live_regime
+
 
 DEFAULT_HISTORY_BARS = 24 * 7  # 7 days of hourly bars by default
 
@@ -381,6 +383,7 @@ def build_live_feature_frame(
     lookback_bars: int = DEFAULT_HISTORY_BARS,
     interval_s: Optional[int] = None,
     candles_by_symbol: Optional[Dict[str, pd.DataFrame]] = None,
+    market_regime: Optional[Dict[str, float]] = None,
 ) -> pd.DataFrame:
     """Build a cross-sectional live feature frame for MLStrategy.
 
@@ -403,10 +406,8 @@ def build_live_feature_frame(
         if frame is not None and not frame.empty:
             symbol_frames[symbol] = frame
 
-    market_regime = _compute_market_regime_features(
-        current_symbol=symbols[0] if symbols else "",
-        symbol_frames=symbol_frames,
-    )
+    if market_regime is None:
+        market_regime = compute_live_regime(symbol_frames)
 
     rows = []
     for symbol in symbols:

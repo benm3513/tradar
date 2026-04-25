@@ -1,4 +1,3 @@
----
 env: paper
 exchange: binance_spot_testnet
 data_source: rest_poll
@@ -57,7 +56,7 @@ strategies:
     exhaustion_reversal_bps: 5
     max_hold_s: 120
     notional_fraction: 0.1
-    price_cap:
+    price_cap: null
   algo2_micro_momentum:
     enabled: false
     min_move_bps: 1
@@ -65,7 +64,7 @@ strategies:
     stop_bps: 5
     max_hold_s: 60
     notional_fraction: 0.05
-    price_cap:
+    price_cap: null
 ml_replay:
   db_path: tradarbot.db
   predictions_table: spike_model_predictions_v50_sig_importance_ensemble
@@ -88,7 +87,7 @@ ml_replay:
   percentile_weight: 0.2
   volatility_weight: 0.35
   time_to_peak_weight: 0.25
-  rank_score_min:
+  rank_score_min: null
   notional_per_trade: 2500
   min_notional_per_trade: 0
   initial_cash: 100000
@@ -109,12 +108,12 @@ ml_replay:
   trailing_stop_activation_pct: 0.08
   partial_take_profit_pct: 0.1
   partial_take_profit_fraction: 0.5
-  time_stop_hours:
+  time_stop_hours: null
   time_stop_min_return_pct: 0.01
   enable_risk_manager: true
   max_daily_loss_usd: 4000
   max_total_exposure_usd: 20000
-  max_total_exposure_pct:
+  max_total_exposure_pct: null
   max_exposure_per_symbol_usd: 7000
   cooldown_minutes_per_symbol: 120
   enable_drawdown_scaling: true
@@ -127,8 +126,8 @@ ml_replay:
   enable_regime_gating: true
   regime_gating_mode: scale
   max_market_risk_off_score: 0.7
-  max_market_dispersion_24h:
-  min_market_trend_strength_24h:
+  max_market_dispersion_24h: null
+  min_market_trend_strength_24h: null
   risk_off_size_multiplier: 0.2
   risk_off_score_raise: 0.0
   prob_thresholds:
@@ -178,7 +177,7 @@ ml_live:
   mode: heuristic
   prediction_source: ensemble
   predictions_table: spike_model_predictions_v50_sig_importance_ensemble
-  score_column:
+  score_column: null
   symbol_column: symbol
   timestamp_column: timestamp
   price_column: price_close
@@ -187,22 +186,22 @@ ml_live:
   rolling_volatility_column: rolling_volatility_24h
   time_to_peak_seconds_column: target_time_to_peak_seconds_24h
   max_prediction_age_minutes: 180.0
-  prob_threshold: 0.1
+  prob_threshold: 0.0
   min_prob_percentile: 0.0
-  min_rolling_volatility_24h:
-  max_predicted_time_to_peak_hours:
+  min_rolling_volatility_24h: null
+  max_predicted_time_to_peak_hours: null
   ranking_mode: composite
   prob_zscore_weight: 1.0
   percentile_weight: 0.2
   volatility_weight: 0.35
   time_to_peak_weight: 0.25
-  rank_score_min:
+  rank_score_min: null
   top_n: 1
   max_positions: 1
   enable_dynamic_max_positions: true
   min_dynamic_max_positions: 1
   dynamic_position_score_threshold: 0.15
-  notional_per_trade: 250.0
+  notional_per_trade: 500.0
   min_notional_per_trade: 25.0
   enable_dynamic_sizing: true
   prob_size_cap: 2.5
@@ -221,12 +220,12 @@ ml_live:
   trailing_stop_activation_pct: 0.08
   partial_take_profit_pct: 0.1
   partial_take_profit_fraction: 0.5
-  time_stop_hours:
+  time_stop_hours: null
   time_stop_min_return_pct: 0.01
   enable_risk_manager: true
   max_daily_loss_usd: 4000
   max_total_exposure_usd: 20000
-  max_total_exposure_pct:
+  max_total_exposure_pct: null
   max_exposure_per_symbol_usd: 7000
   max_drawdown_pct: 0.08
   cooldown_minutes_per_symbol: 120
@@ -239,47 +238,75 @@ ml_live:
   enable_regime_gating: true
   regime_gating_mode: scale
   max_market_risk_off_score: 0.7
-  max_market_dispersion_24h:
-  min_market_trend_strength_24h:
+  max_market_dispersion_24h: null
+  min_market_trend_strength_24h: null
   risk_off_size_multiplier: 0.2
   risk_off_score_raise: 0.0
   feature_lookback_bars: 168
   feature_interval_s: 3600
   candles_table: candles
   emit_observer_events: true
+  warmup_candles: 168
+  min_ready_bars: 168
+  use_centralized_feature_state: true
+  evaluation_interval_s: 1
+  order_notional_buffer: 0.98
 execution_live:
   enabled: true
   broker: live
   provider: alpaca
   mode: paper
-
   base_url: https://paper-api.alpaca.markets
   exchange_info_url: null
-
   api_key_env: ALPACA_API_KEY
   api_secret_env: ALPACA_API_SECRET
-
   request_timeout_s: 10
   account_refresh_s: 5
   order_poll_s: 1
   max_order_polls: 1
-
   client_order_id_prefix: tradar
   default_order_type: limit
   default_tif: IOC
-
-  alpaca_qty_step: 0.000001
+  alpaca_qty_step: 1.0e-06
   alpaca_price_tick: 0.01
-
   starting_cash: 10000
-
   dry_run_fill_policy: fill_immediately
-
-  force_test_order_enabled: false
+  force_test_order_enabled: true
   force_test_order_symbol: ETHUSDT
   force_test_order_qty: 0.011
   force_test_order_premium_bps: 10
   force_test_auto_exit_enabled: false
   force_test_auto_exit_delay_s: 15
   force_test_auto_exit_discount_bps: 10
+  # Unified sizing safeguards: strategy, router, and broker all use these
+  # buffers to avoid tiny precision/available-balance rejects.
+  cash_order_buffer: 0.995
+  position_qty_buffer: 0.995
+  order_notional_buffer: 0.995
 
+  # Broker/orderable universe for Alpaca paper. Keep Binance data universe broad,
+  # but only let MLStrategy submit orders for assets Alpaca can trade.
+  tradable_symbols:
+    - BTCUSDT
+    - ETHUSDT
+
+  # Shutdown flattening should be marketable. A SELL at exactly bid can cancel
+  # before Alpaca accepts the IOC if the quote moves. Use an aggressive limit.
+  close_all_tif: IOC
+  close_all_price_mode: aggressive_limit
+  close_all_slippage_pct: 0.01
+  flatten_on_shutdown: true
+market_data:
+  mode: rest_poll
+  prefer_ws: false
+  rest_fallback: true
+  stale_after_s: 10
+  health_log_interval_s: 30
+feature_state:
+  enabled: true
+  candle_interval_s: 1
+  feature_interval_s: 3600
+  lookback_bars: 168
+  min_ready_bars: 168
+  max_symbols: 200
+  update_on_candle: true

@@ -93,6 +93,18 @@ class State:
         self.ml_last_ranking_ts_ms: Optional[int] = None
         self.ml_last_selection_ts_ms: Optional[int] = None
 
+        # -------------------------
+        # Phase 5.2 live market-data/feature state
+        # -------------------------
+        self.feature_state = None
+        self.feature_state_health: Dict[str, Any] = {}
+        self.market_data_health: Dict[str, Any] = {}
+        self.live_regime_snapshot: Dict[str, Any] = {}
+        self.latest_context_snapshot_metadata: Dict[str, Any] = {}
+        self.rolling_ready_symbols: List[str] = []
+        self.ws_health: Dict[str, Any] = {}
+        self.rest_health: Dict[str, Any] = {}
+
     @staticmethod
     def market_state_factory() -> MarketState:
         return MarketState()
@@ -211,3 +223,27 @@ class State:
     def trim_ml_event_history(self, max_items: int = 500) -> None:
         if len(self.ml_event_history) > max_items:
             del self.ml_event_history[:-max_items]
+
+    # -----------------------------------------------------------------
+    # Phase 5.2 helpers
+    # -----------------------------------------------------------------
+
+    def set_feature_state_health(self, payload: Dict[str, Any]) -> None:
+        self.feature_state_health = dict(payload or {})
+        self.rolling_ready_symbols = list((payload or {}).get("ready_symbol_list", self.rolling_ready_symbols))
+
+    def set_market_data_health(self, payload: Dict[str, Any]) -> None:
+        self.market_data_health = dict(payload or {})
+        if "ws" in self.market_data_health:
+            self.ws_health = dict(self.market_data_health.get("ws") or {})
+        if "rest" in self.market_data_health:
+            self.rest_health = dict(self.market_data_health.get("rest") or {})
+
+    def set_live_regime_snapshot(self, payload: Dict[str, Any]) -> None:
+        self.live_regime_snapshot = dict(payload or {})
+
+    def set_live_context_snapshot_metadata(self, payload: Dict[str, Any]) -> None:
+        self.latest_context_snapshot_metadata = dict(payload or {})
+        ready = self.latest_context_snapshot_metadata.get("ready_symbols")
+        if isinstance(ready, list):
+            self.rolling_ready_symbols = list(ready)

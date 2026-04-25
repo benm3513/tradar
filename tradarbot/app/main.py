@@ -11,9 +11,12 @@ import warnings
 from tradarbot.app.context import Ctx
 from tradarbot.core.bus import EventBus
 from tradarbot.core.engine import StrategyEngine
-from tradarbot.core.events import CandleEvent, ListingEvent, BookEvent, OrderIntent
+from tradarbot.core.events import CandleEvent, ListingEvent, BookEvent, OrderIntent, FeatureStateUpdatedEvent, RegimeContextEvent, LiveContextSnapshotEvent, MarketDataHealthEvent
 from tradarbot.core.state import State
 from tradarbot.data.candles import CandleBuilder1s
+from tradarbot.data.candle_builder import RollingCandleBuilder
+from tradarbot.data.feature_state import RollingFeatureState
+from tradarbot.data.ws_client import LiveMarketDataClient
 from tradarbot.data.symbol_registry import SymbolRegistry
 from tradarbot.exchange.binance.rest import BinanceRestClient
 from tradarbot.exchange.binance.ws_manager import BinanceWSManager
@@ -66,6 +69,17 @@ async def main() -> None:
 
     ctx = Ctx(cfg=cfg, state=state, store=store, broker=broker, risk=risk)
 
+    feature_cfg = cfg.get("feature_state", {}) or {}
+    if bool(feature_cfg.get("enabled", True)):
+        ctx.state.feature_state = RollingFeatureState(
+            lookback_bars=int(feature_cfg.get("lookback_bars", cfg.get("ml_live", {}).get("feature_lookback_bars", 168))),
+            min_ready_bars=int(feature_cfg.get("min_ready_bars", 24)),
+            max_symbols=feature_cfg.get("max_symbols"),
+            interval_s=int(feature_cfg.get("candle_interval_s", cfg.get("runtime", {}).get("candle_interval_s", 1))),
+        )
+    else:
+        ctx.state.feature_state = None
+
     ctx.state.active_symbols = set()
 
     ctx.state._poll_ok = 0
@@ -97,7 +111,11 @@ async def main() -> None:
     engine = StrategyEngine(strategies=strategies, risk=risk, broker=broker, ctx=ctx)
 
     # Route events
-    bus.subscribe(CandleEvent, engine.on_candle)
+    def on_candle_event(ev: CandleEvent):
+        _on_candle_for_feature_state(ctx, bus, ev)
+        return engine.on_candle(ev)
+
+    bus.subscribe(CandleEvent, on_candle_event)
     bus.subscribe(ListingEvent, engine.on_listing)
 
     # Candle builder emits CandleEvents onto the bus
@@ -120,7 +138,10 @@ async def main() -> None:
             ctx.state._candle_count = 0
             ctx.state._last_candle_log = now
 
-    candle_builder = CandleBuilder1s(emit_fn=emit_candle)
+    candle_builder = RollingCandleBuilder(
+        interval_s=int(cfg.get("feature_state", {}).get("candle_interval_s", cfg["runtime"]["candle_interval_s"])),
+        emit_fn=lambda ev: emit_candle(ev.symbol, ev.ts_ms, ev),
+    )
 
     # Exchange clients
     bcfg = cfg.get("binance", {})
@@ -135,6 +156,8 @@ async def main() -> None:
     # Symbol registry -> updates WS subscriptions
     registry_cfg = cfg.get("symbol_registry", {})
     symbol_registry = SymbolRegistry(rest=rest, cfg=registry_cfg, bus=bus)
+    market_data_cfg = cfg.get("market_data", {}) or {}
+    ws_client = LiveMarketDataClient(cfg=cfg, bus=bus, on_book=lambda ev: _on_book(ctx, candle_builder, ev))
 
 
     force_cfg = cfg.get("execution_live", {})
@@ -153,6 +176,8 @@ async def main() -> None:
             async for symset in symbol_registry.run():
                 symbols = set(symset)
                 ctx.state.active_symbols = set(symset)
+                if str(market_data_cfg.get("mode", cfg.get("data_source", "rest_poll"))).lower() in {"ws", "hybrid"}:
+                    await ws_client.set_symbols(set(symset))
                 log.info("REST poll universe symbols=%d", len(symbols))
 
         asyncio.create_task(updater(), name="symbol_updater")
@@ -328,23 +353,128 @@ async def main() -> None:
 
     tasks = [
         asyncio.create_task(bus.run(), name="event_bus"),
-        asyncio.create_task(rest_poll_loop(), name="rest_poll"),
         asyncio.create_task(status_loop(), name="status"),
     ]
+
+    md_mode = str(market_data_cfg.get("mode", cfg.get("data_source", "rest_poll")) or "rest_poll").lower()
+    rest_fallback = bool(market_data_cfg.get("rest_fallback", True))
+    if md_mode in {"rest_poll", "hybrid"} or rest_fallback:
+        tasks.append(asyncio.create_task(rest_poll_loop(), name="rest_poll"))
+    if md_mode in {"ws", "hybrid"}:
+        tasks.append(asyncio.create_task(ws_client.run_forever(), name="ws_market_data"))
+
+    shutdown_started = False
+
+    async def _shutdown(reason: str) -> None:
+        nonlocal shutdown_started
+        if shutdown_started:
+            return
+        shutdown_started = True
+
+        log.warning("SHUTDOWN_START reason=%s flattening_positions", reason)
+
+        flatten_on_shutdown = bool(
+            cfg.get("execution_live", {}).get("flatten_on_shutdown", True)
+        )
+
+        if flatten_on_shutdown and hasattr(broker, "close_all"):
+            try:
+                positions = getattr(broker, "positions", {}) or {}
+                log.warning(
+                    "CLOSE_ALL_REQUESTED reason=%s open_positions=%s",
+                    reason,
+                    list(positions.keys()),
+                )
+                try:
+                    broker.close_all(ctx, reason=reason)
+                except TypeError:
+                    try:
+                        broker.close_all(ctx)
+                    except TypeError:
+                        broker.close_all()
+
+                log.warning("CLOSE_ALL_COMPLETE reason=%s", reason)
+
+            except Exception:
+                    log.exception("CLOSE_ALL_FAILED reason=%s", reason)
+        else:
+            log.warning(
+                "CLOSE_ALL_SKIPPED reason=%s flatten_on_shutdown=%s has_close_all=%s",
+                reason,
+                flatten_on_shutdown,
+                hasattr(broker, "close_all"),
+            )
+
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+
+        await asyncio.gather(*tasks, return_exceptions=True)
+        log.warning("SHUTDOWN_COMPLETE reason=%s", reason)
 
     try:
         await asyncio.gather(*tasks)
     except KeyboardInterrupt:
-        log.warning("Shutting down... flattening positions")
-        broker.close_all(ctx, reason="SHUTDOWN")
+        await _shutdown("KEYBOARD_INTERRUPT")
+    except asyncio.CancelledError:
+        await _shutdown("CANCELLED")
+        raise
+    finally:
+        # In asyncio.run(), Ctrl+C commonly cancels the main task before
+        # KeyboardInterrupt is visible inside this coroutine. The finally block
+        # is the reliable place to flatten positions for manual-stop tests.
+        if not shutdown_started:
+            await _shutdown("FINALLY")
 
-        for t in tasks:
-            t.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 
-def _on_book(ctx: Ctx, candle_builder: CandleBuilder1s, book_event) -> None:
+def _on_candle_for_feature_state(ctx: Ctx, bus: EventBus, ev: CandleEvent) -> None:
+    feature_state = getattr(ctx.state, "feature_state", None)
+    if feature_state is None:
+        return
+
+    feature_state.update_candle(ev)
+    health = feature_state.health_snapshot()
+    ready = feature_state.ready_symbols()
+    health["ready_symbol_list"] = ready
+
+    if hasattr(ctx.state, "set_feature_state_health"):
+        ctx.state.set_feature_state_health(health)
+    else:
+        ctx.state.feature_state_health = health
+        ctx.state.rolling_ready_symbols = ready
+
+    regime = feature_state.compute_regime(ready_only=True)
+    if hasattr(ctx.state, "set_live_regime_snapshot"):
+        ctx.state.set_live_regime_snapshot(regime)
+    else:
+        ctx.state.live_regime_snapshot = regime
+
+    snapshot_metadata = {
+        "ts_ms": int(ev.ts_ms),
+        "symbols": feature_state.symbols(),
+        "ready_symbols": ready,
+        "feature_state": health,
+    }
+    if hasattr(ctx.state, "set_live_context_snapshot_metadata"):
+        ctx.state.set_live_context_snapshot_metadata(snapshot_metadata)
+    else:
+        ctx.state.latest_context_snapshot_metadata = snapshot_metadata
+
+    bus.publish(FeatureStateUpdatedEvent(ts_ms=int(ev.ts_ms), ready_symbols=ready, health=health))
+    bus.publish(RegimeContextEvent(ts_ms=int(ev.ts_ms), regime=regime))
+    bus.publish(
+        LiveContextSnapshotEvent(
+            ts_ms=int(ev.ts_ms),
+            ready_symbols=ready,
+            feature_rows=len(ready),
+            regime=regime,
+            metadata=snapshot_metadata,
+        )
+    )
+
+def _on_book(ctx: Ctx, candle_builder, book_event) -> None:
     """
     book_event provides best bid/ask. We'll build 1s candles from mid.
     """
@@ -361,6 +491,12 @@ def _on_book(ctx: Ctx, candle_builder: CandleBuilder1s, book_event) -> None:
 
     # Persist latest book snapshot (optional)
     ctx.store.upsert_book(book_event.symbol, book_event.ts_ms, book_event.bid, book_event.ask)
+
+    ctx.state.market_data_health = {
+        "last_book_ts_ms": int(book_event.ts_ms),
+        "last_symbol": book_event.symbol,
+        "book_count": getattr(ctx.state, "_book_count", 0) + 1,
+    }
 
     ctx.state._book_count += 1
     now = time.time()

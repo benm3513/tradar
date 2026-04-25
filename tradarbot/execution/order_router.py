@@ -176,6 +176,90 @@ class OrderRouter:
         except (InvalidOperation, ValueError):
             return math.floor(value / step) * step
 
+
+    # ------------------------------------------------------------------
+    # Unified sizing / precision helpers
+    # ------------------------------------------------------------------
+    def normalize_quantity(self, symbol: str, qty: float) -> float:
+        """Round a source or venue quantity exactly as route_intent() will.
+
+        Use this before creating OrderIntent objects and again in LiveBroker before
+        submission so strategy -> router -> broker share one precision policy.
+        """
+        source_symbol = self.to_source_symbol(str(symbol).upper())
+        venue_symbol = self.to_venue_symbol(source_symbol)
+        return self._round_qty(symbol=source_symbol, venue_symbol=venue_symbol, qty=float(qty or 0.0))
+
+    def normalize_price(self, symbol: str, price: float) -> float:
+        """Round a source or venue price exactly as route_intent() will."""
+        source_symbol = self.to_source_symbol(str(symbol).upper())
+        venue_symbol = self.to_venue_symbol(source_symbol)
+        return self._round_price(symbol=source_symbol, venue_symbol=venue_symbol, price=float(price or 0.0))
+
+    def max_buy_quantity_for_cash(
+        self,
+        *,
+        symbol: str,
+        price: float,
+        cash: float,
+        fee_bps: float = 0.0,
+        cash_buffer: float = 0.995,
+    ) -> float:
+        """Largest routed BUY quantity that should fit available cash.
+
+        The calculation uses the routed/rounded limit price, fee estimate, and a
+        configurable cash buffer. The returned quantity is floored to the same
+        provider precision as route_intent().
+        """
+        price = self.normalize_price(symbol, float(price or 0.0))
+        cash = float(cash or 0.0)
+        if price <= 0.0 or cash <= 0.0:
+            return 0.0
+        buffer = max(0.0, min(1.0, float(cash_buffer or 1.0)))
+        fee_mult = 1.0 + max(0.0, float(fee_bps or 0.0)) / 10_000.0
+        raw_qty = (cash * buffer) / max(price * fee_mult, 1e-12)
+        return self.normalize_quantity(symbol, raw_qty)
+
+    def clamp_buy_quantity_to_cash(
+        self,
+        *,
+        symbol: str,
+        desired_qty: float,
+        price: float,
+        cash: float,
+        fee_bps: float = 0.0,
+        cash_buffer: float = 0.995,
+    ) -> float:
+        routed_desired = self.normalize_quantity(symbol, float(desired_qty or 0.0))
+        max_qty = self.max_buy_quantity_for_cash(
+            symbol=symbol,
+            price=price,
+            cash=cash,
+            fee_bps=fee_bps,
+            cash_buffer=cash_buffer,
+        )
+        return self.normalize_quantity(symbol, min(routed_desired, max_qty))
+
+    def clamp_sell_quantity_to_position(
+        self,
+        *,
+        symbol: str,
+        desired_qty: float,
+        available_qty: float,
+        position_buffer: float = 0.995,
+    ) -> float:
+        """Largest routed SELL quantity that should fit available position.
+
+        Alpaca paper can report a slightly smaller available crypto balance than
+        the just-filled local position quantity. The buffer avoids full-size SELL
+        rejects while Phase 5.4 adds exchange reconciliation.
+        """
+        available_qty = max(0.0, float(available_qty or 0.0))
+        desired_qty = max(0.0, float(desired_qty or 0.0))
+        buffer = max(0.0, min(1.0, float(position_buffer or 1.0)))
+        raw_qty = min(desired_qty, available_qty * buffer)
+        return self.normalize_quantity(symbol, raw_qty)
+
     def _client_order_id(self, *, symbol: str, side: str) -> str:
         clean_symbol = symbol.lower().replace("/", "").replace("_", "")
         clean_side = side.lower()

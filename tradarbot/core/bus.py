@@ -31,3 +31,6 @@ class EventBus:
                         await out
                 except Exception:
                     log.exception("handler failed event=%s handler=%s", type(ev).__name__, h)
+
+# Phase 5.2 note: no dispatch semantics changed. The simple queue remains enough
+# for CandleEvent/BookEvent plus optional health/context observer events.

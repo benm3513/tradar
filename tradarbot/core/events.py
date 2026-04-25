@@ -199,4 +199,39 @@ __all__ = [
     "MLEntryRequestEvent",
     "MLExitRequestEvent",
     "MLSignalEvent",
+    "FeatureStateUpdatedEvent",
+    "RegimeContextEvent",
+    "LiveContextSnapshotEvent",
+    "MarketDataHealthEvent",
 ]
+
+# ---------------------------------------------------------------------
+# Phase 5.2 live market-data/context events
+# ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class FeatureStateUpdatedEvent:
+    ts_ms: int
+    ready_symbols: List[str] = field(default_factory=list)
+    health: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class RegimeContextEvent:
+    ts_ms: int
+    regime: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class LiveContextSnapshotEvent:
+    ts_ms: int
+    ready_symbols: List[str] = field(default_factory=list)
+    feature_rows: int = 0
+    regime: Dict[str, Any] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MarketDataHealthEvent:
+    ts_ms: int
+    health: Dict[str, Any] = field(default_factory=dict)

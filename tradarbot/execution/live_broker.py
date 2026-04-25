@@ -6,6 +6,10 @@ from typing import Dict, Optional
 
 from tradarbot.core.events import OrderIntent
 from tradarbot.execution.binance_client import BinanceAPIError
+try:
+    from tradarbot.execution.alpaca_client import AlpacaAPIError
+except Exception:  # keep Binance-only deployments import-safe
+    AlpacaAPIError = RuntimeError
 from tradarbot.execution.exchange_factory import build_exchange_client
 from tradarbot.execution.fill_reconciler import FillReconciler
 from tradarbot.execution.order_router import OrderRouter
@@ -56,6 +60,17 @@ class LiveBroker:
         self.reconciler = FillReconciler()
         self.order_poll_s = float(self.exec_cfg.get("order_poll_s", 1.0) or 1.0)
         self.max_order_polls = int(self.exec_cfg.get("max_order_polls", 1) or 1)
+        self.cash_order_buffer = float(self.exec_cfg.get("cash_order_buffer", self.exec_cfg.get("order_notional_buffer", 0.995)) or 0.995)
+        self.position_qty_buffer = float(self.exec_cfg.get("position_qty_buffer", 0.995) or 0.995)
+
+        # Shutdown / emergency flatten behavior.
+        # A close-all SELL at exactly bid can cancel if the quote moves before Alpaca
+        # accepts the IOC. Use an aggressive limit below bid by default so the
+        # liquidation order behaves marketable while still going through the
+        # existing limit-order path.
+        self.close_all_tif = str(self.exec_cfg.get("close_all_tif", "IOC") or "IOC")
+        self.close_all_price_mode = str(self.exec_cfg.get("close_all_price_mode", "aggressive_limit") or "aggressive_limit").lower()
+        self.close_all_slippage_pct = float(self.exec_cfg.get("close_all_slippage_pct", 0.01) or 0.01)
 
     def positions_snapshot(self):
         return {
@@ -217,6 +232,22 @@ class LiveBroker:
                 )
                 return
 
+        routed = self._cap_routed_order_to_available(routed, ctx)
+        if routed.quantity <= 0.0:
+            log.warning(
+                "LIVE_PRETRADE_BLOCKED symbol=%s side=%s reason=non_positive_after_balance_cap",
+                routed.symbol,
+                routed.side,
+            )
+            self.store.insert_execution_event(
+                ts_ms=ts_ms,
+                symbol=routed.symbol,
+                event_type="pretrade_blocked",
+                broker_mode=self.broker_mode,
+                details={"reason": "non_positive_after_balance_cap"},
+            )
+            return
+
         self.store.insert_order(
             client_order_id=routed.client_order_id,
             exchange_order_id=None,
@@ -275,7 +306,28 @@ class LiveBroker:
                     tif=str(routed.tif or "IOC"),
                     client_order_id=routed.client_order_id,
                 )
-        except BinanceAPIError as exc:
+        except (BinanceAPIError, AlpacaAPIError) as exc:
+            retry_response = self._retry_sell_with_available_from_error(routed=routed, exc=exc, ctx=ctx, ts_ms=ts_ms)
+            if retry_response is not None:
+                log.info(
+                    "LIVE_ORDER_RETRY_RESPONSE symbol=%s client_order_id=%s response=%r",
+                    routed.symbol,
+                    routed.client_order_id,
+                    retry_response,
+                )
+                state = self.reconciler.normalize_order(retry_response)
+                self.store.update_order_status(
+                    client_order_id=routed.client_order_id,
+                    status=state.status,
+                    updated_ts_ms=state.update_ts_ms or ts_ms,
+                    exchange_order_id=state.exchange_order_id,
+                    metadata=state.raw,
+                )
+                self._apply_order_state(state, ctx)
+                if not state.is_final:
+                    self._poll_until_terminal(symbol=routed.symbol, client_order_id=routed.client_order_id, exchange_order_id=state.exchange_order_id, ctx=ctx)
+                return
+
             self.store.update_order_status(
                 client_order_id=routed.client_order_id,
                 status="REJECTED",
@@ -369,22 +421,250 @@ class LiveBroker:
         if not state.is_final:
             self._poll_until_terminal(symbol=routed.symbol, client_order_id=routed.client_order_id, exchange_order_id=state.exchange_order_id, ctx=ctx)
 
-    def close_all(self, ctx, reason: str = "manual") -> None:
-        for symbol, pos in list(self.positions.items()):
-            if pos.qty <= 0.0:
-                continue
-            bid, _ = self._resolve_book(ctx, symbol)
-            if bid is None or bid <= 0.0:
-                continue
-            log.info("LIVE_CLOSE_ALL_REQUEST symbol=%s qty=%.8f reason=%s", symbol, pos.qty, reason)
-            self.execute_intent(OrderIntent(side="SELL", symbol=symbol, qty=pos.qty, limit_px=bid, tif="IOC"), ctx)
-            self.store.insert_execution_event(
-                ts_ms=self._resolve_ts_ms(ctx),
-                symbol=symbol,
-                event_type="close_all_requested",
-                broker_mode=self.broker_mode,
-                details={"reason": reason},
+    def _cap_routed_order_to_available(self, routed, ctx):
+        """Final broker-side sizing guard.
+
+        MLStrategy should already use OrderRouter for precision/cash-aware sizing,
+        but the broker is the last line of defense before the exchange. This keeps
+        strategy -> router -> broker quantity semantics identical.
+        """
+        side = str(routed.side).upper()
+        if side == "BUY":
+            price = float(routed.price or 0.0)
+            if price <= 0.0:
+                return routed
+            capped_qty = self.router.clamp_buy_quantity_to_cash(
+                symbol=routed.symbol,
+                desired_qty=float(routed.quantity or 0.0),
+                price=price,
+                cash=float(self.cash or 0.0),
+                fee_bps=float(self.fee_bps or 0.0),
+                cash_buffer=float(self.cash_order_buffer or 1.0),
             )
+            if capped_qty < float(routed.quantity or 0.0):
+                log.info(
+                    "LIVE_SIZE_CAPPED side=BUY symbol=%s old_qty=%.8f new_qty=%.8f cash=%.8f price=%.8f buffer=%.4f",
+                    routed.symbol,
+                    float(routed.quantity or 0.0),
+                    float(capped_qty),
+                    float(self.cash or 0.0),
+                    price,
+                    float(self.cash_order_buffer or 1.0),
+                )
+                routed.quantity = capped_qty
+            return routed
+
+        if side == "SELL":
+            pos = self._local_position_for_symbol(routed.symbol)
+            available_qty = float(getattr(pos, "qty", 0.0) or 0.0) if pos is not None else 0.0
+            capped_qty = self.router.clamp_sell_quantity_to_position(
+                symbol=routed.symbol,
+                desired_qty=float(routed.quantity or 0.0),
+                available_qty=available_qty,
+                position_buffer=float(self.position_qty_buffer or 1.0),
+            )
+            if capped_qty < float(routed.quantity or 0.0):
+                log.info(
+                    "LIVE_SIZE_CAPPED side=SELL symbol=%s old_qty=%.8f new_qty=%.8f local_available=%.8f buffer=%.4f",
+                    routed.symbol,
+                    float(routed.quantity or 0.0),
+                    float(capped_qty),
+                    available_qty,
+                    float(self.position_qty_buffer or 1.0),
+                )
+                routed.quantity = capped_qty
+            return routed
+
+        return routed
+
+    def _local_position_for_symbol(self, symbol: str):
+        for candidate in self._market_symbol_candidates(symbol):
+            pos = self.positions.get(candidate)
+            if pos is not None:
+                return pos
+        return self.positions.get(symbol)
+
+    def _retry_sell_with_available_from_error(self, *, routed, exc, ctx, ts_ms: int):
+        """Retry an Alpaca SELL once when the API reports a smaller available qty.
+
+        Example error: "insufficient balance for BTC (requested: 0.007094,
+        available: 0.007076265)". This protects shutdown flattening and live exits
+        from tiny exchange/local-position drift.
+        """
+        if str(routed.side).upper() != "SELL":
+            return None
+        text = str(exc)
+        try:
+            payload = getattr(exc, "payload", None)
+            if isinstance(payload, dict):
+                text += " " + str(payload.get("message") or payload.get("error") or "")
+        except Exception:
+            pass
+
+        import re
+        match = re.search(r"available:\s*([0-9]*\.?[0-9]+)", text, re.IGNORECASE)
+        if not match:
+            return None
+        available = float(match.group(1))
+        retry_qty = self.router.clamp_sell_quantity_to_position(
+            symbol=routed.symbol,
+            desired_qty=float(routed.quantity or 0.0),
+            available_qty=available,
+            position_buffer=float(self.position_qty_buffer or 1.0),
+        )
+        if retry_qty <= 0.0 or retry_qty >= float(routed.quantity or 0.0):
+            return None
+
+        old_qty = routed.quantity
+        old_client_order_id = routed.client_order_id
+        try:
+            self.store.update_order_status(
+                client_order_id=old_client_order_id,
+                status="REJECTED",
+                updated_ts_ms=ts_ms,
+                exchange_order_id=None,
+                error_code=str(getattr(exc, "status_code", "")) or None,
+                error_message=str(exc),
+                metadata={"retrying_with_available_qty": True, "available_qty": available},
+            )
+        except Exception:
+            log.exception("LIVE_ORDER_RETRY_MARK_ORIGINAL_REJECTED_FAILED client_order_id=%s", old_client_order_id)
+
+        routed.quantity = retry_qty
+        retry_client_order_id = self.router._client_order_id(symbol=self.router.to_source_symbol(routed.symbol), side=routed.side)
+        routed.client_order_id = retry_client_order_id
+        log.warning(
+            "LIVE_ORDER_RETRY_AVAILABLE_QTY symbol=%s side=SELL old_qty=%.8f available=%.8f retry_qty=%.8f client_order_id=%s",
+            routed.symbol,
+            float(old_qty or 0.0),
+            available,
+            retry_qty,
+            retry_client_order_id,
+        )
+        self.store.insert_order(
+            client_order_id=routed.client_order_id,
+            exchange_order_id=None,
+            symbol=routed.symbol,
+            side=routed.side,
+            order_type=routed.order_type,
+            tif=routed.tif,
+            qty=routed.quantity,
+            limit_px=routed.price,
+            status="SUBMITTED",
+            broker_mode=self.broker_mode,
+            submitted_ts_ms=ts_ms,
+            updated_ts_ms=ts_ms,
+            strategy_name=None,
+            metadata={**dict(routed.raw or {}), "retry_after_available_qty_error": True, "old_qty": old_qty, "available_qty": available},
+        )
+        try:
+            if routed.order_type == "MARKET":
+                response = self.client.place_market_order(
+                    symbol=routed.symbol,
+                    side=routed.side,
+                    quantity=routed.quantity,
+                    client_order_id=routed.client_order_id,
+                )
+            else:
+                response = self.client.place_limit_order(
+                    symbol=routed.symbol,
+                    side=routed.side,
+                    quantity=routed.quantity,
+                    price=float(routed.price or 0.0),
+                    tif=str(routed.tif or "IOC"),
+                    client_order_id=routed.client_order_id,
+                )
+            return response
+        except Exception:
+            log.exception("LIVE_ORDER_RETRY_FAILED symbol=%s side=%s client_order_id=%s", routed.symbol, routed.side, routed.client_order_id)
+            return None
+
+    def close_all(self, ctx=None, reason: str = "manual") -> None:
+        """Flatten all locally tracked live positions.
+
+        This is intentionally broker-local and should be safe for shutdown:
+        - iterates actual self.positions keys, usually venue symbols like ETH/USD
+        - supports LivePosition dataclass objects, not dict-only positions
+        - resolves market-data book from ctx when available
+        - uses an aggressive SELL limit below bid/current price
+        - sends through execute_intent() so routing, DB logging, fills, and sizing
+          guards remain centralized
+        """
+        log.info("CLOSE_ALL_REQUESTED reason=%s", reason)
+        log.info("CLOSE_ALL_START positions=%s", list(self.positions.keys()))
+
+        for symbol, pos in list(self.positions.items()):
+            qty = float(getattr(pos, "qty", 0.0) or 0.0)
+            if qty <= 0.0:
+                log.info("CLOSE_ALL_SKIP_EMPTY symbol=%s qty=%.8f", symbol, qty)
+                continue
+
+            bid, ask = self._resolve_book(ctx, symbol) if ctx is not None else (None, None)
+            price = self._close_all_limit_price(symbol=symbol, pos=pos, bid=bid, ask=ask)
+
+            if price is None or float(price) <= 0.0:
+                log.warning(
+                    "CLOSE_ALL_SKIPPED no_price symbol=%s bid=%s ask=%s current_price=%s avg_px=%s",
+                    symbol,
+                    bid,
+                    ask,
+                    getattr(pos, "current_price", None),
+                    getattr(pos, "avg_px", None),
+                )
+                continue
+
+            # Use the exact local qty here. execute_intent() will route/floor to venue
+            # precision and _cap_routed_order_to_available() will apply the final
+            # position buffer / availability cap before submission.
+            log.info(
+                "CLOSE_ALL_SUBMIT symbol=%s qty=%.8f limit_px=%.8f tif=%s bid=%s ask=%s reason=%s",
+                symbol,
+                qty,
+                float(price),
+                self.close_all_tif,
+                bid,
+                ask,
+                reason,
+            )
+
+            intent = OrderIntent(
+                side="SELL",
+                symbol=symbol,
+                qty=qty,
+                limit_px=float(price),
+                tif=self.close_all_tif,
+            )
+
+            self.execute_intent(intent, ctx)
+
+    def _close_all_limit_price(self, *, symbol: str, pos: LivePosition, bid: Optional[float], ask: Optional[float]) -> Optional[float]:
+        """Return the liquidation limit price used by close_all()."""
+        reference = None
+        if bid is not None and float(bid) > 0.0:
+            reference = float(bid)
+        elif getattr(pos, "current_price", None) is not None and float(pos.current_price) > 0.0:
+            reference = float(pos.current_price)
+        elif getattr(pos, "avg_px", None) is not None and float(pos.avg_px) > 0.0:
+            reference = float(pos.avg_px)
+
+        if reference is None or reference <= 0.0:
+            return None
+
+        mode = self.close_all_price_mode
+        if mode in {"bid", "passive", "at_bid"}:
+            raw_price = reference
+        else:
+            # For a SELL, lower limit price is more aggressive and more likely
+            # to fill immediately as IOC. Bound slippage to avoid accidental zero.
+            slip = max(0.0, min(float(self.close_all_slippage_pct or 0.0), 0.25))
+            raw_price = reference * (1.0 - slip)
+
+        try:
+            venue_symbol = self.router.to_venue_symbol(symbol)
+            return self.router._round_price(symbol=symbol, venue_symbol=venue_symbol, price=raw_price)
+        except Exception:
+            log.exception("LIVE_CLOSE_ALL_PRICE_ROUND_FAILED symbol=%s raw_price=%.8f", symbol, raw_price)
+            return raw_price
 
     def _poll_until_terminal(self, *, symbol: str, client_order_id: str, exchange_order_id: Optional[str], ctx) -> None:
         for poll_idx in range(max(0, self.max_order_polls)):
