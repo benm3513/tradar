@@ -68,16 +68,80 @@ class EnsembleBuildResult:
 
 
 def _validate_weights(w6: float, w24: float, w72: float, tol: float = 1e-9) -> None:
+    validate_ensemble_weights(w6, w24, w72, tol=tol)
+
+
+
+def validate_ensemble_weights(
+    w6: float,
+    w24: float,
+    w72: float,
+    tol: float = 1e-9,
+    *,
+    allow_partial: bool = False,
+) -> None:
+    """Public reusable ensemble-weight validator for replay and live inference."""
     for name, value in (("w6", w6), ("w24", w24), ("w72", w72)):
         if value < 0:
             raise ValueError(f"{name} must be >= 0")
-    total = w6 + w24 + w72
-    if abs(total - 1.0) > tol:
+    total = float(w6) + float(w24) + float(w72)
+    target = 1.0 if not allow_partial else total
+    if total <= 0:
+        raise ValueError("ensemble weights must have positive total")
+    if not allow_partial and abs(total - target) > tol:
         raise ValueError(
             f"ensemble weights must sum to 1.0; got {total:.12f} "
             f"(w6={w6}, w24={w24}, w72={w72})"
         )
 
+
+def compute_ensemble_frame(
+    df: pd.DataFrame,
+    *,
+    w6: float,
+    w24: float,
+    w72: float,
+    threshold: float = 0.8,
+    agreement_boost: float = 0.05,
+    require_all_horizons: bool = True,
+) -> pd.DataFrame:
+    """Compute ensemble columns on an in-memory horizon-probability frame.
+
+    This is intentionally pandas-only so both the SQLite replay builder and
+    Phase 5.3 live inference can share the exact same ensemble math.
+    """
+    out = df.copy()
+    weights = {"6h": float(w6), "24h": float(w24), "72h": float(w72)}
+    present = [h for h in ("6h", "24h", "72h") if f"prob_{h}" in out.columns]
+    missing = [h for h in ("6h", "24h", "72h") if h not in present]
+    if missing and require_all_horizons:
+        raise KeyError(f"missing required probability columns: {[f'prob_{h}' for h in missing]}")
+    if not present:
+        raise KeyError("no prob_6h/prob_24h/prob_72h columns available for ensemble")
+
+    for h in present:
+        col = f"prob_{h}"
+        out[col] = pd.to_numeric(out[col], errors="coerce").clip(lower=0.0, upper=1.0)
+    out = out.dropna(subset=[f"prob_{h}" for h in present]).copy()
+
+    out["prob_ensemble"] = 0.0
+    for h in present:
+        out["prob_ensemble"] = out["prob_ensemble"] + weights[h] * out[f"prob_{h}"]
+
+    agreement_count = 0
+    for h in present:
+        agreement_count = agreement_count + (out[f"prob_{h}"] >= float(threshold)).astype(int)
+    out["agreement_count"] = agreement_count
+    out["agreement_boost_applied"] = (out["agreement_count"] >= 2).astype(int) * float(agreement_boost)
+    out["ensemble_score"] = (out["prob_ensemble"] + out["agreement_boost_applied"]).clip(lower=0.0, upper=1.0)
+    out["weight_6h"] = float(w6)
+    out["weight_24h"] = float(w24)
+    out["weight_72h"] = float(w72)
+    out["agreement_threshold"] = float(threshold)
+    out["agreement_boost"] = float(agreement_boost)
+    out["target_column"] = "ensemble_score"
+    out["horizon"] = "ensemble"
+    return out
 
 def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
     row = conn.execute(

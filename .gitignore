@@ -53,3 +53,4 @@ backtests/
 *.db-shm
 *.db
 config/*.phase5_*
+artifacts/

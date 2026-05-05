@@ -22,13 +22,11 @@ log = logging.getLogger("tradarbot.ml_strategy")
 
 class MLStrategy:
     """
-    Phase 5.0 live ML strategy with replay-parity filtering/ranking/sizing.
+    Phase 5.0/5.3 live ML strategy with replay-parity filtering/ranking/sizing.
 
-    Keeps the integration-safe fixes:
-    - has `name` for StrategyEngine
-    - uses in-memory candle history instead of replay DB tables
-    - reuses replay helper math for filtering/ranking/sizing
-    - guards replay helper calls that assume diagnostics objects
+    Debug upgrade:
+    - Adds ML_DEBUG logs around each early-return checkpoint in on_candle.
+    - Does not change thresholds, ranking, sizing, or order logic.
     """
 
     name = "ml_strategy"
@@ -36,7 +34,7 @@ class MLStrategy:
     def __init__(self, cfg: Dict):
         self.cfg = dict(cfg or {})
         self.predictor = LivePredictor(self.cfg)
-        self.router = None  # initialized lazily from full ctx.cfg so provider rules match broker
+        self.router = None
 
         self.last_signal_ts: Dict[str, int] = {}
         self.last_eval_ts_by_symbol: Dict[str, int] = {}
@@ -54,7 +52,6 @@ class MLStrategy:
         )
         self.use_centralized_feature_state = bool(self.cfg.get("use_centralized_feature_state", True))
 
-        # Size live BUYs conservatively from buffered cash and limit price.
         self.order_notional_buffer = float(
             self.cfg.get("order_notional_buffer", self.cfg.get("live_order_notional_buffer", 0.99))
             or 0.99
@@ -62,9 +59,15 @@ class MLStrategy:
         if self.order_notional_buffer <= 0.0 or self.order_notional_buffer > 1.0:
             self.order_notional_buffer = 0.99
 
-        # Build replay-compatible runtime args once at startup. Do not reload YAML inside
-        # the live candle loop.
         self.runtime_args = self._build_runtime_args()
+
+        log.info(
+            "MLStrategy predictor initialized mode=%s min_ready_bars=%s lookback_bars=%s centralized_feature_state=%s",
+            getattr(self.predictor, "mode", self.cfg.get("predictor_mode", self.cfg.get("mode"))),
+            self.min_ready_bars,
+            self.lookback_bars,
+            self.use_centralized_feature_state,
+        )
 
     def on_listing(self, ev, ctx):
         return []
@@ -73,42 +76,135 @@ class MLStrategy:
         self._record_candle(e)
         self._sync_state_symbol(e.symbol, ctx)
 
+        log.info(
+            "ML_DEBUG on_candle symbol=%s ts_ms=%s local_bars=%s min_ready_bars=%s lookback_bars=%s",
+            e.symbol,
+            e.ts_ms,
+            len(self.price_history.get(e.symbol, [])),
+            self.min_ready_bars,
+            self.lookback_bars,
+        )
+
         last_eval = self.last_eval_ts_by_symbol.get(e.symbol)
         if last_eval is not None:
             min_gap_ms = max(1, self.evaluation_interval_s) * 1000
-            if int(e.ts_ms) - int(last_eval) < min_gap_ms:
+            gap_ms = int(e.ts_ms) - int(last_eval)
+            if gap_ms < min_gap_ms:
+                log.info(
+                    "ML_DEBUG return=eval_interval symbol=%s gap_ms=%s min_gap_ms=%s",
+                    e.symbol,
+                    gap_ms,
+                    min_gap_ms,
+                )
                 return []
 
         symbols = sorted(set(getattr(ctx.state, "active_symbols", set()) or {e.symbol}))
         if e.symbol not in symbols:
             symbols.append(e.symbol)
+
+        log.info("ML_DEBUG active_symbols_before_filter=%s", symbols)
+
         symbols = self._filter_tradable_symbols(symbols, ctx)
+        log.info("ML_DEBUG symbols_after_filter=%s", symbols)
+
         if not symbols:
+            log.info("ML_DEBUG return=no_symbols_after_filter")
             return []
 
         ready_symbols = self._ready_symbols(symbols, ctx)
+        log.info(
+            "ML_DEBUG ready_symbols=%s min_ready_bars=%s local_counts=%s",
+            ready_symbols,
+            self.min_ready_bars,
+            {s: len(self.price_history.get(s, [])) for s in symbols},
+        )
+
         if not ready_symbols:
+            fs = self._get_feature_state(ctx)
+            fs_symbols = []
+            fs_ready = []
+            try:
+                if fs is not None and hasattr(fs, "symbols"):
+                    fs_symbols = fs.symbols()
+                if fs is not None and hasattr(fs, "ready_symbols"):
+                    fs_ready = fs.ready_symbols()
+            except Exception as ex:
+                log.info("ML_DEBUG feature_state_inspect_failed=%s", ex)
+
+            log.info(
+                "ML_DEBUG return=no_ready_symbols feature_state_present=%s feature_state_symbols=%s feature_state_ready=%s",
+                fs is not None,
+                fs_symbols,
+                fs_ready,
+            )
             return []
 
         feature_df = self._build_feature_frame(ready_symbols, ctx)
+        log.info(
+            "ML_DEBUG feature_df rows=%s cols=%s",
+            0 if feature_df is None else len(feature_df),
+            [] if feature_df is None or feature_df.empty else list(feature_df.columns),
+        )
+
         if feature_df.empty:
+            log.info("ML_DEBUG return=empty_feature_df ready_symbols=%s", ready_symbols)
             return []
 
         prediction_map = self.predictor.predict(feature_df, ctx=ctx)
+        log.info(
+            "ML_DEBUG prediction_map symbols=%s",
+            list(prediction_map.keys()) if prediction_map else [],
+        )
+
+        if prediction_map:
+            for symbol, payload in prediction_map.items():
+                log.info(
+                    "ML_DEBUG prediction symbol=%s prob=%s pred_prob=%s score=%s source=%s model=%s",
+                    symbol,
+                    payload.get("prob"),
+                    payload.get("pred_prob"),
+                    payload.get("score"),
+                    payload.get("prediction_source"),
+                    payload.get("model_name"),
+                )
+
         candidate_df = self._merge_predictions(feature_df, prediction_map)
+        log.info(
+            "ML_DEBUG candidate_df rows=%s cols=%s",
+            0 if candidate_df is None else len(candidate_df),
+            [] if candidate_df is None or candidate_df.empty else list(candidate_df.columns),
+        )
+
         if candidate_df.empty:
+            log.info(
+                "ML_DEBUG return=empty_candidate_df feature_symbols=%s",
+                feature_df["symbol"].astype(str).tolist() if "symbol" in feature_df.columns else [],
+            )
             return []
 
         args = self.runtime_args
         ranked = self._filter_ranked(candidate_df, args)
+        log.info(
+            "ML_DEBUG ranked rows=%s symbols=%s",
+            0 if ranked is None else len(ranked),
+            [] if ranked is None or ranked.empty or "symbol" not in ranked.columns else ranked["symbol"].astype(str).tolist(),
+        )
+
         self._update_state_with_rankings(ctx, ranked, int(e.ts_ms))
 
         if ranked.empty:
             self.last_eval_ts_by_symbol[e.symbol] = int(e.ts_ms)
+            log.info(
+                "ML_DEBUG return=empty_ranked prob_threshold=%s min_prob_percentile=%s top_n=%s",
+                getattr(args, "prob_threshold", None),
+                getattr(args, "min_prob_percentile", None),
+                getattr(args, "top_n", None),
+            )
             return []
 
         intents = self._build_entry_intents(ranked, args, ctx, ts_ms=int(e.ts_ms))
         self.last_eval_ts_by_symbol[e.symbol] = int(e.ts_ms)
+        log.info("ML_DEBUG intents_count=%s", len(intents))
         return intents
 
     def _record_candle(self, e):
@@ -123,13 +219,6 @@ class MLStrategy:
             ctx.state.get_ml_symbol_state(symbol)
 
     def _filter_tradable_symbols(self, symbols: List[str], ctx) -> List[str]:
-        """Apply optional broker/execution allowlist before generating ML orders.
-
-        The live market-data universe may contain symbols that the selected broker
-        cannot trade. For example, Binance.US can stream BNBUSDT, but Alpaca paper
-        rejects BNB/USD as an unknown asset. Keep the data universe broad, but make
-        the orderable ML universe config-driven.
-        """
         root_cfg = getattr(ctx, "cfg", {}) if ctx is not None else {}
         exec_cfg = root_cfg.get("execution_live", {}) if isinstance(root_cfg, dict) else {}
         ml_cfg = root_cfg.get("ml_live", {}) if isinstance(root_cfg, dict) else {}
@@ -147,18 +236,15 @@ class MLStrategy:
         out = []
         for symbol in symbols:
             normalized = str(symbol).upper().replace("/", "")
-            # Accept either BTCUSDT style or BTCUSD style entries.
             alt = normalized[:-1] if normalized.endswith("T") else normalized
             if normalized in allowed or alt in allowed:
                 out.append(symbol)
         skipped = sorted(set(symbols) - set(out))
         if skipped:
             if getattr(self, "_last_filter_log", None) != tuple(skipped):
-                log.info(
-                    "ML_TRADABLE_FILTER skipped=%s allowed=%s",
-                    skipped, allowed
-                )
+                log.info("ML_TRADABLE_FILTER skipped=%s allowed=%s", skipped, allowed)
                 self._last_filter_log = tuple(skipped)
+        return out
 
     def _get_feature_state(self, ctx) -> Any:
         state = getattr(ctx, "state", None)
@@ -195,6 +281,7 @@ class MLStrategy:
             except Exception:
                 log.exception("MLStrategy failed to build frame from centralized feature state")
                 candles_by_symbol = {}
+
         if not candles_by_symbol:
             for symbol in symbols:
                 rows = self.price_history.get(symbol, [])
@@ -248,12 +335,6 @@ class MLStrategy:
         return pd.DataFrame(rows)
 
     def _build_runtime_args(self):
-        """Build replay-compatible runtime args from the already-loaded ml_live cfg.
-
-        Important: live trading must not re-read config/tradar.yaml inside the
-        candle loop. YAML is loaded once in app/main.py and this strategy receives
-        the ml_live section as `self.cfg`.
-        """
         args = SimpleNamespace(**dict(self.cfg or {}))
 
         defaults = {
@@ -328,8 +409,6 @@ class MLStrategy:
             return out.reset_index(drop=True)
 
     def _get_router(self, ctx) -> OrderRouter:
-        # The router must be built from the full app config, not the ml_live subsection,
-        # so symbol mapping, venue precision, and provider rules match LiveBroker.
         if self.router is None:
             self.router = OrderRouter(getattr(ctx, "cfg", {}) or {})
         return self.router
@@ -345,7 +424,6 @@ class MLStrategy:
             for sym, pos in broker_positions.items()
             if float(getattr(pos, "qty", 0.0) or 0.0) > 0.0
         }
-        # Treat venue-form symbols like BTC/USD as already open for source-form BTCUSDT.
         mapped_open_symbols = set(open_symbols)
         for sym in list(open_symbols):
             try:
@@ -391,8 +469,6 @@ class MLStrategy:
             if limit_px <= 0.0:
                 continue
 
-            # Unified sizing: strategy uses the same router precision and cash cap
-            # that LiveBroker will enforce before order submission.
             desired_qty = target_notional / max(limit_px, 1e-12)
             qty = router.clamp_buy_quantity_to_cash(
                 symbol=symbol,

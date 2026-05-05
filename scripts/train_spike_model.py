@@ -55,7 +55,14 @@ import json
 import logging
 import sqlite3
 from dataclasses import dataclass, asdict
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Sequence
+
+try:
+    import joblib
+except Exception:  # pragma: no cover
+    joblib = None
 
 import numpy as np
 import pandas as pd
@@ -252,6 +259,27 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=5,
         help="Number of repeats for permutation importance.",
+    )
+    parser.add_argument(
+        "--save-artifacts",
+        action="store_true",
+        help="Save trained model pipelines and metadata as Phase 5.3 runtime artifacts.",
+    )
+    parser.add_argument(
+        "--artifact-dir",
+        default="artifacts/models/default",
+        help="Directory where model_6h.joblib / metadata files are written.",
+    )
+    parser.add_argument(
+        "--model-version",
+        default=None,
+        help="Version string written into model artifact metadata.",
+    )
+    parser.add_argument(
+        "--artifact-format",
+        choices=["joblib"],
+        default="joblib",
+        help="Artifact format. Currently only joblib is supported.",
     )
     parser.add_argument("--if-exists", choices=["fail", "replace", "append"], default="replace")
     parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
@@ -577,6 +605,78 @@ def build_permutation_importance_frame(
     return pi_df
 
 
+
+def save_model_artifact(
+    *,
+    model: Pipeline,
+    result: TrainResult,
+    artifact_dir: str,
+    model_version: str | None,
+    feature_columns: Sequence[str],
+    input_table: str,
+    model_type: str,
+) -> None:
+    """Save one horizon model and registry-compatible metadata."""
+    if joblib is None:
+        raise RuntimeError("joblib is required for --save-artifacts. Run: pip install joblib")
+
+    out_dir = Path(artifact_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    model_path = out_dir / f"model_{result.horizon}.joblib"
+    metadata_path = out_dir / f"model_{result.horizon}_metadata.json"
+
+    joblib.dump(model, model_path)
+    metadata = {
+        "horizon": result.horizon,
+        "target_column": result.target_column,
+        "feature_columns": list(feature_columns),
+        "feature_count_used": result.feature_count_used,
+        "model_type": model_type,
+        "model_name": result.model_name,
+        "model_version": model_version,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "input_table": input_table,
+        "train_rows": result.train_rows,
+        "test_rows": result.test_rows,
+        "metrics": {
+            "roc_auc": result.roc_auc,
+            "pr_auc": result.pr_auc,
+            "brier_score": result.brier_score,
+            "best_threshold_f1": result.best_threshold_f1,
+            "precision_at_best_f1": result.precision_at_best_f1,
+            "recall_at_best_f1": result.recall_at_best_f1,
+            "f1_at_best_f1": result.f1_at_best_f1,
+            "positive_rate_train": result.positive_rate_train,
+            "positive_rate_test": result.positive_rate_test,
+        },
+        "artifact_format": "joblib",
+        "model_path": str(model_path),
+        "metadata_path": str(metadata_path),
+    }
+    with metadata_path.open("w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+    LOGGER.info("Saved model artifact horizon=%s -> %s", result.horizon, model_path)
+    LOGGER.info("Saved model metadata horizon=%s -> %s", result.horizon, metadata_path)
+
+
+def write_registry_manifest(artifact_dir: str, model_version: str | None, horizons: Sequence[str]) -> None:
+    out_dir = Path(artifact_dir)
+    manifest = {
+        "active_version": model_version,
+        "artifacts_dir": str(out_dir),
+        "horizons": {
+            h: {
+                "model_path": str(out_dir / f"model_{h}.joblib"),
+                "metadata_path": str(out_dir / f"model_{h}_metadata.json"),
+            }
+            for h in horizons
+        },
+    }
+    with (out_dir / "model_registry.json").open("w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, sort_keys=True)
+    LOGGER.info("Saved model registry manifest -> %s", out_dir / "model_registry.json")
+
 def train_one_horizon(
     *,
     conn: sqlite3.Connection,
@@ -596,7 +696,7 @@ def train_one_horizon(
     enable_permutation_importance: bool,
     permutation_importance_table_prefix: str,
     permutation_repeats: int,
-) -> tuple[TrainResult, pd.DataFrame]:
+) -> tuple[TrainResult, pd.DataFrame, Pipeline]:
     target_column = resolve_target_column(
         df,
         horizon=horizon,
@@ -715,7 +815,7 @@ def train_one_horizon(
         y_prob=y_prob,
         result=result,
     )
-    return result, predictions_df
+    return result, predictions_df, model
 
 
 def main() -> int:
@@ -732,7 +832,7 @@ def main() -> int:
             metrics_rows: list[dict[str, object]] = []
 
             for idx, horizon in enumerate(SUPPORTED_HORIZONS):
-                result, predictions_df = train_one_horizon(
+                result, predictions_df, model = train_one_horizon(
                     conn=conn,
                     df=df,
                     horizon=horizon,
@@ -759,13 +859,27 @@ def main() -> int:
                 write_table(conn, predictions_df, predictions_table, write_mode)
                 LOGGER.info("Wrote predictions for horizon=%s -> %s", horizon, predictions_table)
 
+                if args.save_artifacts:
+                    save_model_artifact(
+                        model=model,
+                        result=result,
+                        artifact_dir=args.artifact_dir,
+                        model_version=args.model_version,
+                        feature_columns=args.feature_columns,
+                        input_table=args.input_table,
+                        model_type=args.model,
+                    )
+
+            if args.save_artifacts:
+                write_registry_manifest(args.artifact_dir, args.model_version, SUPPORTED_HORIZONS)
+
             metrics_df = pd.DataFrame(metrics_rows)
             write_table(conn, metrics_df, args.metrics_table, args.if_exists)
             LOGGER.info("Wrote multi-horizon metrics -> %s", args.metrics_table)
 
         else:
             horizon = args.horizon
-            result, predictions_df = train_one_horizon(
+            result, predictions_df, model = train_one_horizon(
                 conn=conn,
                 df=df,
                 horizon=horizon,
@@ -794,6 +908,18 @@ def main() -> int:
                 args.metrics_table,
                 args.predictions_table,
             )
+
+            if args.save_artifacts:
+                save_model_artifact(
+                    model=model,
+                    result=result,
+                    artifact_dir=args.artifact_dir,
+                    model_version=args.model_version,
+                    feature_columns=args.feature_columns,
+                    input_table=args.input_table,
+                    model_type=args.model,
+                )
+                write_registry_manifest(args.artifact_dir, args.model_version, [horizon])
 
     finally:
         conn.close()
