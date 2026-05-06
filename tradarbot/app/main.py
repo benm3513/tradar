@@ -3,7 +3,6 @@ import logging
 import time
 import httpx
 from typing import Any, Dict, Set
-import sqlite3
 
 import yaml
 import pandas as pd
@@ -28,6 +27,8 @@ from tradarbot.storage.sqlite_store import SQLiteStore
 from tradarbot.strategies.algo2_micro_momentum import Algo2MicroMomentum
 from tradarbot.strategies.algo1_new_listing_pump import Algo1NewListingPump
 from tradarbot.strategies.ml_strategy import MLStrategy
+from tradarbot.portfolio.reconcile import PortfolioReconciler
+from tradarbot.portfolio.exits import ExitManager
 
 
 pd.set_option('future.no_silent_downcasting', True)
@@ -43,180 +44,6 @@ def setup_logging(level: str) -> None:
         level=numeric,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-
-def _warm_feature_state_from_store(ctx: Ctx, cfg: Dict[str, Any], log: logging.Logger) -> None:
-    feature_state = getattr(ctx.state, "feature_state", None)
-    if feature_state is None:
-        return
-
-    ml_cfg = cfg.get("ml_live", {}) or {}
-    feature_cfg = cfg.get("feature_state", {}) or {}
-
-    enabled = bool(feature_cfg.get("backfill_on_startup", ml_cfg.get("backfill_on_startup", True)))
-    if not enabled:
-        log.info("FEATURE_BACKFILL disabled")
-        return
-
-    symbols = (
-        feature_cfg.get("backfill_symbols")
-        or ml_cfg.get("tradable_symbols")
-        or cfg.get("execution_live", {}).get("tradable_symbols")
-        or ["BTCUSDT", "ETHUSDT"]
-    )
-
-    symbols = [str(s).upper().replace("/", "") for s in symbols]
-
-    lookback_bars = int(feature_cfg.get("lookback_bars", ml_cfg.get("feature_lookback_bars", 168)))
-    interval_s = int(feature_cfg.get("candle_interval_s", cfg.get("runtime", {}).get("candle_interval_s", 3600)))
-    db_path = cfg.get("storage", {}).get("db_path", "tradarbot.db")
-
-    try:
-        conn = sqlite3.connect(db_path)
-        total = 0
-
-        for symbol in symbols:
-            df = pd.read_sql_query(
-                """
-                SELECT symbol, ts_ms, interval_s, open, high, low, close, volume
-                FROM candles
-                WHERE symbol = ?
-                  AND interval_s = ?
-                ORDER BY ts_ms DESC
-                LIMIT ?
-                """,
-                conn,
-                params=(symbol, interval_s, lookback_bars),
-            )
-
-            if df.empty:
-                log.warning("FEATURE_BACKFILL no rows symbol=%s interval_s=%s", symbol, interval_s)
-                continue
-
-            df = df.sort_values("ts_ms")
-
-            for row in df.itertuples(index=False):
-                ev = CandleEvent(
-                    symbol=str(row.symbol),
-                    interval_s=int(row.interval_s),
-                    ts_ms=int(row.ts_ms),
-                    open=float(row.open),
-                    high=float(row.high),
-                    low=float(row.low),
-                    close=float(row.close),
-                    volume=float(row.volume),
-                )
-                feature_state.update_candle(ev)
-                total += 1
-
-            log.info(
-                "FEATURE_BACKFILL loaded symbol=%s rows=%d interval_s=%s",
-                symbol,
-                len(df),
-                interval_s,
-            )
-
-        ready = feature_state.ready_symbols()
-        log.info(
-            "FEATURE_BACKFILL complete total_rows=%d ready_symbols=%s all_symbols=%s",
-            total,
-            ready,
-            feature_state.symbols(),
-        )
-
-    except Exception:
-        log.exception("FEATURE_BACKFILL failed")
-
-
-def _latest_backfilled_candles_from_feature_state(ctx: Ctx, log: logging.Logger) -> list[CandleEvent]:
-    """Return one latest warmed CandleEvent per ready symbol.
-
-    This is a startup-only ML kick. Backfill warms RollingFeatureState, but it
-    does not automatically call StrategyEngine.on_candle(). With 1h candles,
-    waiting for the next candle close can delay model serving after restart.
-
-    The kick replays only the latest already-warmed candle for each ready symbol
-    through the normal bus/engine route so MLStrategy can run immediately. It
-    does not write new DB rows and does not bypass risk/broker flow.
-    """
-    feature_state = getattr(ctx.state, "feature_state", None)
-    if feature_state is None:
-        return []
-
-    try:
-        ready_symbols = list(feature_state.ready_symbols())
-    except Exception:
-        log.exception("ML_STARTUP_KICK failed to inspect ready_symbols")
-        return []
-
-    events: list[CandleEvent] = []
-    for symbol in ready_symbols:
-        try:
-            frame = feature_state.get_symbol_frame(symbol)
-        except Exception:
-            log.exception("ML_STARTUP_KICK failed to read feature frame symbol=%s", symbol)
-            continue
-
-        if frame is None or frame.empty:
-            log.warning("ML_STARTUP_KICK no frame for ready symbol=%s", symbol)
-            continue
-
-        row = frame.iloc[-1]
-        try:
-            interval_s = int(row.get("interval_s", getattr(feature_state, "interval_s", 3600) or 3600))
-            ev = CandleEvent(
-                symbol=str(row.get("symbol", symbol)),
-                interval_s=interval_s,
-                ts_ms=int(row["ts_ms"]),
-                open=float(row["open"]),
-                high=float(row["high"]),
-                low=float(row["low"]),
-                close=float(row["close"]),
-                volume=float(row.get("volume", 0.0) or 0.0),
-            )
-            events.append(ev)
-        except Exception:
-            log.exception("ML_STARTUP_KICK failed to build candle event symbol=%s", symbol)
-            continue
-
-    return events
-
-
-async def _run_ml_startup_kick(ctx: Ctx, cfg: Dict[str, Any], bus: EventBus, log: logging.Logger) -> None:
-    """Trigger ML once from warmed feature state after startup backfill.
-
-    Config:
-      ml_live.startup_kick_enabled: true|false
-      feature_state.startup_kick_enabled: true|false
-
-    Default is enabled when backfill_on_startup is enabled. The kick publishes
-    normal CandleEvents to the EventBus, so all normal feature-state, strategy,
-    risk, and broker routing still apply.
-    """
-    ml_cfg = cfg.get("ml_live", {}) or {}
-    feature_cfg = cfg.get("feature_state", {}) or {}
-
-    enabled = bool(
-        feature_cfg.get(
-            "startup_kick_enabled",
-            ml_cfg.get("startup_kick_enabled", feature_cfg.get("backfill_on_startup", ml_cfg.get("backfill_on_startup", True))),
-        )
-    )
-    if not enabled:
-        log.info("ML_STARTUP_KICK disabled")
-        return
-
-    # Let the event bus task start before publishing kick events.
-    await asyncio.sleep(float(feature_cfg.get("startup_kick_delay_s", ml_cfg.get("startup_kick_delay_s", 0.25)) or 0.25))
-
-    events = _latest_backfilled_candles_from_feature_state(ctx, log)
-    if not events:
-        log.warning("ML_STARTUP_KICK no events ready")
-        return
-
-    log.info("ML_STARTUP_KICK publishing events=%d symbols=%s", len(events), [e.symbol for e in events])
-    for ev in events:
-        bus.publish(ev)
-
 
 
 async def main() -> None:
@@ -244,6 +71,18 @@ async def main() -> None:
 
     ctx = Ctx(cfg=cfg, state=state, store=store, broker=broker, risk=risk)
 
+    # Phase 5.4: reconcile local/exchange portfolio state before strategies trade.
+    if bool(cfg.get("portfolio", {}).get("enabled", True)):
+        try:
+            reconciler = PortfolioReconciler(cfg, store, broker)
+            reconciliation_result = reconciler.reconcile_startup(ctx)
+            ctx.state.set_reconciliation_result(reconciliation_result)
+        except Exception:
+            log.exception("RECONCILE_STARTUP_FAILED")
+            if bool(cfg.get("portfolio", {}).get("reconciliation", {}).get("fail_closed_on_error", True)):
+                ctx.state.portfolio_fail_closed = True
+
+
     feature_cfg = cfg.get("feature_state", {}) or {}
     if bool(feature_cfg.get("enabled", True)):
         ctx.state.feature_state = RollingFeatureState(
@@ -254,8 +93,6 @@ async def main() -> None:
         )
     else:
         ctx.state.feature_state = None
-
-    _warm_feature_state_from_store(ctx, cfg, log)
 
     ctx.state.active_symbols = set()
 
@@ -286,6 +123,7 @@ async def main() -> None:
     log.info("loaded strategies=%s", [s.name for s in strategies])
 
     engine = StrategyEngine(strategies=strategies, risk=risk, broker=broker, ctx=ctx)
+    exit_manager = ExitManager.from_config(cfg)
 
     # Route events
     def on_candle_event(ev: CandleEvent):
@@ -495,6 +333,35 @@ async def main() -> None:
             await asyncio.sleep(interval)
 
 
+    async def portfolio_exit_loop():
+        interval_s = float(cfg.get("portfolio", {}).get("exit_check_interval_s", 1.0) or 1.0)
+        while True:
+            try:
+                now_ts_ms = int(time.time() * 1000)
+                if hasattr(broker, "sync_state_positions"):
+                    broker.sync_state_positions(ctx)
+                decisions = exit_manager.evaluate_all(getattr(ctx.state, "live_positions", {}) or {}, ctx.state, now_ts_ms)
+                routed = 0
+                for decision in decisions:
+                    if not decision.should_exit:
+                        continue
+                    if hasattr(broker, "has_open_exit_order") and broker.has_open_exit_order(decision.symbol):
+                        log.info("EXIT_MANAGER skip_duplicate_exit symbol=%s reason=%s", decision.symbol, decision.reason)
+                        continue
+                    intent = exit_manager.to_order_intent(decision)
+                    if intent is None:
+                        continue
+                    log.info("EXIT_SIGNAL symbol=%s qty=%.8f limit_px=%.8f reason=%s partial=%s", decision.symbol, decision.qty, decision.limit_px, decision.reason, decision.partial)
+                    engine._handle_strategy_outputs([intent], "portfolio_exit_manager")
+                    routed += 1
+                if hasattr(broker, "persist_position_snapshots"):
+                    broker.persist_position_snapshots(ctx)
+                log.info("EXIT_MANAGER checked positions=%d decisions=%d routed=%d", len(getattr(ctx.state, "live_positions", {}) or {}), len(decisions), routed)
+            except Exception:
+                log.exception("EXIT_MANAGER_FAILED")
+            await asyncio.sleep(interval_s)
+
+
     async def status_loop():
         while True:
             sym_count = len(getattr(ctx.state, "active_symbols", set()))
@@ -517,6 +384,10 @@ async def main() -> None:
                 getattr(ctx.state, "_poll_err", 0),
                 getattr(ctx.state, "_poll_backoff_s", 0.0),
             )
+            if hasattr(broker, "sync_state_positions"):
+                broker.sync_state_positions(ctx)
+            if hasattr(risk, "update_from_portfolio_snapshot") and getattr(ctx.state, "portfolio_snapshot", None):
+                risk.update_from_portfolio_snapshot(ctx.state.portfolio_snapshot)
             ctx.store.insert_equity_snapshot(
                 ts_ms=int(time.time() * 1000),
                 cash=broker.cash,
@@ -531,12 +402,8 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(bus.run(), name="event_bus"),
         asyncio.create_task(status_loop(), name="status"),
+        asyncio.create_task(portfolio_exit_loop(), name="portfolio_exit"),
     ]
-
-    # Phase 5.3 cold-start fix: when feature backfill warmed enough 1h candles,
-    # publish one latest CandleEvent per ready symbol so ML artifact inference can
-    # run immediately instead of waiting for the next hourly candle close.
-    tasks.append(asyncio.create_task(_run_ml_startup_kick(ctx, cfg, bus, log), name="ml_startup_kick"))
 
     md_mode = str(market_data_cfg.get("mode", cfg.get("data_source", "rest_poll")) or "rest_poll").lower()
     rest_fallback = bool(market_data_cfg.get("rest_fallback", True))

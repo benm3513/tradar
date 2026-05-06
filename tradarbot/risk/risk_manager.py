@@ -122,6 +122,7 @@ class RiskManager:
 
         self._daily_loss_active = False
         self._drawdown_breach_active = False
+        self.last_portfolio_snapshot: Dict[str, Any] = {}
 
     def _opt_float(self, key: str) -> Optional[float]:
         value = self.config.get(key)
@@ -396,6 +397,23 @@ class RiskManager:
     # Live-engine API
     # ------------------------------------------------------------------
 
+    def update_from_portfolio_snapshot(self, snapshot) -> None:
+        data = snapshot.to_dict() if hasattr(snapshot, "to_dict") else dict(snapshot or {})
+        self.last_portfolio_snapshot = data
+        positions = dict(data.get("positions", {}) or {})
+        exposure_by_symbol = {}
+        unrealized_total = 0.0
+        for symbol, pos in positions.items():
+            if hasattr(pos, "to_dict"):
+                pos = pos.to_dict()
+            qty = float(pos.get("qty", 0.0) or 0.0)
+            px = pos.get("current_price") or pos.get("avg_px") or 0.0
+            exposure_by_symbol[str(symbol)] = max(0.0, qty * float(px or 0.0))
+            unrealized_total += float(pos.get("unrealized_pnl", 0.0) or 0.0)
+        self.update_positions(exposure_by_symbol=exposure_by_symbol, total_exposure=float(data.get("total_exposure", sum(exposure_by_symbol.values())) or 0.0), unrealized_pnl_total=unrealized_total)
+        if data.get("equity") is not None:
+            self.update_equity(float(data.get("equity") or 0.0))
+
     def check(self, intent, ctx, strat_name: Optional[str] = None) -> Dict[str, Any]:
         if intent is None:
             return {"approved": False, "intent": intent, "reason": "missing_intent", "reason_category": "validation", "strat_name": strat_name}
@@ -417,13 +435,20 @@ class RiskManager:
         if tif not in {"IOC", "GTC", "FOK", "MARKET"}:
             return {"approved": False, "intent": intent, "reason": "unsupported_tif", "reason_category": "validation", "strat_name": strat_name}
 
-        # Always allow exits through.
+        # Always allow exits through, including safe mode / fail-closed states.
         if side == "SELL":
             return {"approved": True, "intent": intent, "reason": None, "reason_category": None, "strat_name": strat_name}
 
+        last_recon = getattr(getattr(ctx, "state", None), "last_reconciliation", {}) or {}
+        if bool(getattr(getattr(ctx, "state", None), "portfolio_fail_closed", False)) or bool(last_recon.get("fail_closed_active", False)):
+            self.trades_blocked_by_risk_count += 1
+            return {"approved": False, "intent": intent, "reason": "portfolio_reconciliation_fail_closed", "reason_category": "risk", "strat_name": strat_name}
+
+        live_positions = getattr(getattr(ctx, "state", None), "live_positions", {}) or {}
+
         if self.max_positions is not None:
             broker = getattr(ctx, "broker", None)
-            positions = getattr(broker, "positions", {}) if broker is not None else {}
+            positions = live_positions or (getattr(broker, "positions", {}) if broker is not None else {})
             open_count = 0
             for _, pos in dict(positions or {}).items():
                 qty_val = float(getattr(pos, "qty", getattr(pos, "quantity", 0.0)) or 0.0)
@@ -431,12 +456,13 @@ class RiskManager:
                     open_count += 1
 
             already_open = False
-            if broker is not None and hasattr(broker, "positions"):
+            pos = None
+            if live_positions:
+                pos = live_positions.get(symbol)
+            if pos is None and broker is not None and hasattr(broker, "positions"):
                 pos = broker.positions.get(symbol)
-                if pos is not None:
-                    already_open = bool(
-                        float(getattr(pos, "qty", getattr(pos, "quantity", 0.0)) or 0.0) > 0.0
-                    )
+            if pos is not None:
+                already_open = bool(float(getattr(pos, "qty", getattr(pos, "quantity", 0.0)) or 0.0) > 0.0)
 
             if open_count >= int(self.max_positions) and not already_open:
                 self.trades_blocked_by_risk_count += 1
@@ -452,6 +478,14 @@ class RiskManager:
         if cash > 0.0 and proposed_notional > cash:
             self.trades_blocked_by_risk_count += 1
             return {"approved": False, "intent": intent, "reason": "insufficient_cash", "reason_category": "capital", "strat_name": strat_name}
+
+        if live_positions:
+            exposure_by_symbol = {}
+            for psym, pos in dict(live_positions).items():
+                qty_val = float(getattr(pos, "qty", 0.0) or 0.0)
+                px_val = getattr(pos, "current_price", None) or getattr(pos, "avg_px", 0.0)
+                exposure_by_symbol[str(psym)] = max(0.0, qty_val * float(px_val or 0.0))
+            self.update_positions(exposure_by_symbol=exposure_by_symbol, total_exposure=sum(exposure_by_symbol.values()))
 
         allowed, reason = self.can_enter_trade(symbol, proposed_notional)
         if not allowed:
@@ -519,7 +553,7 @@ class RiskManager:
             return None
         if reason in {"max_exposure_per_symbol_usd", "max_total_exposure_usd", "max_total_exposure_pct", "max_positions"}:
             return "exposure"
-        if reason in {"daily_loss_limit", "drawdown_limit", "kill_switch_active", "symbol_cooldown"}:
+        if reason in {"daily_loss_limit", "drawdown_limit", "kill_switch_active", "symbol_cooldown", "portfolio_reconciliation_fail_closed"}:
             return "risk"
         if reason in {"min_notional_per_trade", "missing_symbol", "non_positive_qty", "non_positive_limit_px", "unsupported_tif"}:
             return "validation"
@@ -545,6 +579,7 @@ class RiskManager:
                 self.activate_kill_switch("drawdown_limit")
         else:
             self._drawdown_breach_active = False
+        self.last_portfolio_snapshot: Dict[str, Any] = {}
 
     def _refresh_from_ctx(self, ctx) -> None:
         if ctx is None:

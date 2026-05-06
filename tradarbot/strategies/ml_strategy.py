@@ -102,13 +102,13 @@ class MLStrategy:
         if e.symbol not in symbols:
             symbols.append(e.symbol)
 
-        log.info("ML_DEBUG active_symbols_before_filter=%s", symbols)
+        log.debug("ML_DEBUG active_symbols_before_filter=%s", symbols)
 
         symbols = self._filter_tradable_symbols(symbols, ctx)
-        log.info("ML_DEBUG symbols_after_filter=%s", symbols)
+        log.debug("ML_DEBUG symbols_after_filter=%s", symbols)
 
         if not symbols:
-            log.info("ML_DEBUG return=no_symbols_after_filter")
+            log.debug("ML_DEBUG return=no_symbols_after_filter")
             return []
 
         ready_symbols = self._ready_symbols(symbols, ctx)
@@ -129,7 +129,7 @@ class MLStrategy:
                 if fs is not None and hasattr(fs, "ready_symbols"):
                     fs_ready = fs.ready_symbols()
             except Exception as ex:
-                log.info("ML_DEBUG feature_state_inspect_failed=%s", ex)
+                log.debug("ML_DEBUG feature_state_inspect_failed=%s", ex)
 
             log.info(
                 "ML_DEBUG return=no_ready_symbols feature_state_present=%s feature_state_symbols=%s feature_state_ready=%s",
@@ -147,7 +147,7 @@ class MLStrategy:
         )
 
         if feature_df.empty:
-            log.info("ML_DEBUG return=empty_feature_df ready_symbols=%s", ready_symbols)
+            log.debug("ML_DEBUG return=empty_feature_df ready_symbols=%s", ready_symbols)
             return []
 
         prediction_map = self.predictor.predict(feature_df, ctx=ctx)
@@ -204,7 +204,7 @@ class MLStrategy:
 
         intents = self._build_entry_intents(ranked, args, ctx, ts_ms=int(e.ts_ms))
         self.last_eval_ts_by_symbol[e.symbol] = int(e.ts_ms)
-        log.info("ML_DEBUG intents_count=%s", len(intents))
+        log.debug("ML_DEBUG intents_count=%s", len(intents))
         return intents
 
     def _record_candle(self, e):
@@ -242,7 +242,7 @@ class MLStrategy:
         skipped = sorted(set(symbols) - set(out))
         if skipped:
             if getattr(self, "_last_filter_log", None) != tuple(skipped):
-                log.info("ML_TRADABLE_FILTER skipped=%s allowed=%s", skipped, allowed)
+                log.debug("ML_TRADABLE_FILTER skipped=%s allowed=%s", skipped, allowed)
                 self._last_filter_log = tuple(skipped)
         return out
 

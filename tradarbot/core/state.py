@@ -247,3 +247,79 @@ class State:
         ready = self.latest_context_snapshot_metadata.get("ready_symbols")
         if isinstance(ready, list):
             self.rolling_ready_symbols = list(ready)
+
+# ---------------------------------------------------------------------
+# Phase 5.4 portfolio-state helpers attached without disturbing prior ML state.
+# ---------------------------------------------------------------------
+try:
+    from tradarbot.portfolio.positions import LivePositionState, PortfolioSnapshot
+except Exception:  # import-safe for partial deployments
+    LivePositionState = None
+    PortfolioSnapshot = None
+
+
+_original_state_init = State.__init__
+
+
+def _phase54_state_init(self):
+    _original_state_init(self)
+    self.live_positions = {}
+    self.portfolio_snapshot = {}
+    self.last_reconciliation = {}
+    self.exit_state_by_symbol = {}
+    self.portfolio_fail_closed = False
+
+
+def _set_live_position(self, symbol, position):
+    if position is None:
+        self.remove_live_position(symbol)
+        return
+    sym = str(symbol or getattr(position, "symbol", ""))
+    self.live_positions[sym] = position
+    try:
+        ml_state = self.get_ml_symbol_state(sym)
+        ml_state.open_position_managed_by_ml = True
+        ml_state.trailing_stop_price = getattr(position, "trailing_stop_price", None)
+        ml_state.peak_price = getattr(position, "peak_price", None)
+        ml_state.partial_exit_taken = bool(getattr(position, "partial_exit_taken", False))
+    except Exception:
+        pass
+
+
+def _remove_live_position(self, symbol):
+    sym = str(symbol)
+    self.live_positions.pop(sym, None)
+    try:
+        ml_state = self.get_ml_symbol_state(sym)
+        ml_state.open_position_managed_by_ml = False
+        ml_state.trailing_stop_price = None
+        ml_state.peak_price = None
+        ml_state.partial_exit_taken = False
+    except Exception:
+        pass
+
+
+def _get_live_position(self, symbol):
+    return self.live_positions.get(str(symbol))
+
+
+def _set_portfolio_snapshot(self, snapshot):
+    if hasattr(snapshot, "to_dict"):
+        self.portfolio_snapshot = snapshot.to_dict()
+        self.live_positions = dict(getattr(snapshot, "positions", {}) or {})
+    else:
+        self.portfolio_snapshot = dict(snapshot or {})
+
+
+def _set_reconciliation_result(self, result):
+    data = result.to_dict() if hasattr(result, "to_dict") else dict(result or {})
+    self.last_reconciliation = data
+    self.portfolio_fail_closed = bool(data.get("fail_closed_active", False))
+
+
+State.__init__ = _phase54_state_init
+State.set_live_position = _set_live_position
+State.remove_live_position = _remove_live_position
+State.get_live_position = _get_live_position
+State.set_portfolio_snapshot = _set_portfolio_snapshot
+State.set_reconciliation_result = _set_reconciliation_result

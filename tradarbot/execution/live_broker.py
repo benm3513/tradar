@@ -15,6 +15,7 @@ from tradarbot.execution.fill_reconciler import FillReconciler
 from tradarbot.execution.order_router import OrderRouter
 from tradarbot.execution.symbol_mapper import SymbolMapper
 from tradarbot.execution.slippage import validate_execution_bounds
+from tradarbot.portfolio.positions import LivePositionState, PortfolioSnapshot, PositionOwner, position_notional
 
 log = logging.getLogger("tradarbot.live_broker")
 
@@ -26,6 +27,10 @@ class LivePosition:
     entry_ts_ms: Optional[int] = None
     current_price: Optional[float] = None
     unrealized_pnl: float = 0.0
+    realized_pnl: float = 0.0
+    peak_price: Optional[float] = None
+    trailing_stop_price: Optional[float] = None
+    partial_exit_taken: bool = False
 
 
 class LiveBroker:
@@ -73,15 +78,7 @@ class LiveBroker:
         self.close_all_slippage_pct = float(self.exec_cfg.get("close_all_slippage_pct", 0.01) or 0.01)
 
     def positions_snapshot(self):
-        return {
-            k: {
-                "qty": v.qty,
-                "avg_px": v.avg_px,
-                "current_price": v.current_price,
-                "unrealized_pnl": v.unrealized_pnl,
-            }
-            for k, v in self.positions.items()
-        }
+        return {k: v.to_dict() for k, v in self.canonical_positions().items()}
 
     def metrics_snapshot(self):
         avg_hold = (self.total_hold_s / self.trades) if self.trades > 0 else 0.0
@@ -803,20 +800,33 @@ class LiveBroker:
     def _apply_fill(self, fill, ctx) -> None:
         pos = self.positions.get(fill.symbol, LivePosition())
         fill_fee = float(fill.fee or 0.0)
-        if fill.side == "BUY":
+        side = str(fill.side).upper()
+        position_event = None
+        realized_delta = 0.0
+
+        if side == "BUY":
             if pos.qty <= 1e-12:
                 pos.entry_ts_ms = fill.ts_ms
+                pos.peak_price = None
+                pos.trailing_stop_price = None
+                pos.partial_exit_taken = False
+                position_event = "ENTRY_FILL"
+            else:
+                position_event = "INCREASE_FILL"
             total_cost = pos.avg_px * pos.qty + fill.px * fill.qty
             pos.qty += fill.qty
             if pos.qty > 0:
                 pos.avg_px = total_cost / pos.qty
+            pos.current_price = fill.px
             self.cash -= (fill.qty * fill.px) + fill_fee
         else:
             sell_qty = min(pos.qty, fill.qty)
             gross_pnl = (fill.px - pos.avg_px) * sell_qty
-            self.realized_pnl += gross_pnl - fill_fee
+            realized_delta = gross_pnl - fill_fee
+            self.realized_pnl += realized_delta
+            pos.realized_pnl += realized_delta
             self.cash += (sell_qty * fill.px) - fill_fee
-            if gross_pnl - fill_fee >= 0.0:
+            if realized_delta >= 0.0:
                 self.wins += 1
                 self.current_losing_streak = 0
             else:
@@ -827,20 +837,121 @@ class LiveBroker:
             if pos.entry_ts_ms is not None and fill.ts_ms > 0:
                 self.total_hold_s += max(0.0, (fill.ts_ms - pos.entry_ts_ms) / 1000.0)
             pos.qty = max(0.0, pos.qty - sell_qty)
-            if pos.qty <= 1e-12:
+            pos.current_price = fill.px
+            if pos.qty > 1e-12:
+                pos.partial_exit_taken = True
+                position_event = "PARTIAL_EXIT_FILL"
+            else:
+                position_event = "EXIT_FILL"
                 pos = LivePosition()
+
         self.positions[fill.symbol] = pos
+        if getattr(pos, "qty", 0.0) <= 1e-12:
+            self.positions.pop(fill.symbol, None)
+
+        try:
+            self.store.insert_position_event(
+                ts_ms=fill.ts_ms or self._resolve_ts_ms(ctx),
+                symbol=fill.symbol,
+                event_type=position_event or f"{side}_FILL",
+                qty=fill.qty,
+                px=fill.px,
+                reason=(position_event or side).lower(),
+                strategy_name=None,
+                client_order_id=getattr(fill, "client_order_id", None),
+                exchange_order_id=getattr(fill, "exchange_order_id", None),
+                metadata={"fee": fill_fee, "realized_pnl_delta": realized_delta, "raw": getattr(fill, "raw", {})},
+            )
+            log.info("POSITION_EVENT %s symbol=%s qty=%.8f px=%.8f", position_event, fill.symbol, fill.qty, fill.px)
+        except Exception:
+            log.exception("POSITION_EVENT_PERSIST_FAILED symbol=%s", fill.symbol)
+
         equity = self.equity(getattr(ctx, "state", None))
+        self.sync_state_positions(ctx)
+        self.persist_position_snapshots(ctx)
         log.info(
             "LIVE_POSITION_UPDATED symbol=%s side=%s qty=%.8f avg_px=%.8f cash=%.8f realized_pnl=%.8f equity=%.8f",
             fill.symbol,
             fill.side,
-            self.positions[fill.symbol].qty,
-            self.positions[fill.symbol].avg_px,
+            self.positions.get(fill.symbol, LivePosition()).qty,
+            self.positions.get(fill.symbol, LivePosition()).avg_px,
             self.cash,
             self.realized_pnl,
             equity,
         )
+
+    def canonical_positions(self, ctx=None) -> Dict[str, LivePositionState]:
+        state = getattr(ctx, "state", None) if ctx is not None else None
+        if state is not None:
+            self.unrealized_pnl(state)
+        out: Dict[str, LivePositionState] = {}
+        for symbol, pos in dict(self.positions or {}).items():
+            if float(getattr(pos, "qty", 0.0) or 0.0) <= 0.0:
+                continue
+            venue_symbol = symbol
+            try:
+                venue_symbol = self.router.to_venue_symbol(symbol)
+            except Exception:
+                pass
+            out[symbol] = LivePositionState(
+                symbol=symbol,
+                venue_symbol=venue_symbol,
+                qty=float(pos.qty or 0.0),
+                avg_px=float(pos.avg_px or 0.0),
+                entry_ts_ms=pos.entry_ts_ms,
+                current_price=pos.current_price,
+                unrealized_pnl=float(pos.unrealized_pnl or 0.0),
+                realized_pnl=float(getattr(pos, "realized_pnl", 0.0) or 0.0),
+                peak_price=getattr(pos, "peak_price", None),
+                trailing_stop_price=getattr(pos, "trailing_stop_price", None),
+                partial_exit_taken=bool(getattr(pos, "partial_exit_taken", False)),
+                owner=PositionOwner(strategy_name="live_broker"),
+                metadata={"broker_mode": self.broker_mode, "provider": self.provider},
+            )
+        return out
+
+    def sync_state_positions(self, ctx) -> None:
+        if ctx is None or not hasattr(ctx, "state"):
+            return
+        positions = self.canonical_positions(ctx)
+        ctx.state.live_positions = positions
+        for sym, pos in positions.items():
+            if hasattr(ctx.state, "set_live_position"):
+                ctx.state.set_live_position(sym, pos)
+        for sym in list(getattr(ctx.state, "live_positions", {}).keys()):
+            if sym not in positions and hasattr(ctx.state, "remove_live_position"):
+                ctx.state.remove_live_position(sym)
+
+    def persist_position_snapshots(self, ctx) -> None:
+        if ctx is None or not hasattr(ctx, "store"):
+            return
+        ts_ms = self._resolve_ts_ms(ctx) or 0
+        positions = self.canonical_positions(ctx)
+        unrealized = sum(float(p.unrealized_pnl or 0.0) for p in positions.values())
+        total_exposure = sum(position_notional(p) for p in positions.values())
+        snapshot = PortfolioSnapshot(
+            ts_ms=ts_ms, cash=float(self.cash or 0.0), equity=float(self.account_equity or 0.0),
+            realized_pnl=float(self.realized_pnl or 0.0), unrealized_pnl=unrealized,
+            total_exposure=total_exposure, positions=positions, broker_mode=self.broker_mode,
+            metadata={"provider": self.provider},
+        )
+        if hasattr(ctx.state, "set_portfolio_snapshot"):
+            ctx.state.set_portfolio_snapshot(snapshot)
+        if hasattr(ctx.store, "insert_portfolio_snapshot"):
+            ctx.store.insert_portfolio_snapshot(snapshot)
+        log.info("PORTFOLIO_SNAPSHOT broker_mode=%s positions=%d equity=%.8f exposure=%.8f", self.broker_mode, len(positions), self.account_equity, total_exposure)
+
+    def has_open_exit_order(self, symbol: str) -> bool:
+        candidates = set(self._market_symbol_candidates(symbol))
+        candidates.add(str(symbol))
+        for order in dict(self.open_orders or {}).values():
+            if str(order.get("side", "")).upper() != "SELL":
+                continue
+            if str(order.get("status", "")).upper() in {"FILLED", "CANCELED", "REJECTED", "EXPIRED", "ERROR"}:
+                continue
+            if str(order.get("symbol")) in candidates:
+                return True
+        return False
 
     def _resolve_book(self, ctx, symbol: str):
         """Resolve bid/ask using either venue or market-data symbol forms.
