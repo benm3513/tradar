@@ -1,0 +1,24 @@
+services:
+  tradar:
+    build: .
+    container_name: tradar
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TRADAR_CONFIG: /app/config/tradar.yaml
+      TRADAR_PROFILE: ${TRADAR_PROFILE:-paper}
+      TRADAR_DB_PATH: /data/tradarbot.db
+      TRADAR_DATA_DIR: /data
+      TRADAR_ARTIFACT_DIR: /app/artifacts/models/v50_sig_importance
+    volumes:
+      - ./data:/data
+      - ./config:/app/config:ro
+      - ./artifacts:/app/artifacts:ro
+    command: ["python", "run.py", "--config", "config/tradar.yaml", "--profile", "paper"]
+    healthcheck:
+      test: ["CMD", "python", "deploy/healthcheck.py", "--config", "config/tradar.yaml"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s

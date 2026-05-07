@@ -31,8 +31,23 @@ ws:
   - 10
   - 30
 runtime:
+  profile: ${TRADAR_PROFILE:-paper}
   candle_interval_s: 1
-  log_level: INFO
+  log_level: ${TRADAR_LOG_LEVEL:-INFO}
+  data_dir: ${TRADAR_DATA_DIR:-.}
+  db_path: ${TRADAR_DB_PATH:-tradarbot.db}
+  artifact_dir: ${TRADAR_ARTIFACT_DIR:-artifacts/models/v50_sig_importance}
+
+deployment:
+  enabled: true
+  service_name: tradar
+  environment: ${TRADAR_ENV:-local}
+  healthcheck:
+    enabled: true
+    db_required: true
+    artifacts_required: true
+    exchange_ping: false
+    max_candle_age_seconds: 7200
 execution:
   fee_bps: 10
   entry_slippage_cap_pct: 0.0025
@@ -253,9 +268,9 @@ ml_live:
   order_notional_buffer: 0.98
 execution_live:
   enabled: true
-  broker: live
-  provider: alpaca
-  mode: paper
+  broker: paper
+  provider: ${EXECUTION_PROVIDER:-alpaca}
+  mode: ${EXECUTION_MODE:-paper}
   base_url: https://paper-api.alpaca.markets
   exchange_info_url: null
   api_key_env: ALPACA_API_KEY
@@ -271,7 +286,7 @@ execution_live:
   alpaca_price_tick: 0.01
   starting_cash: 10000
   dry_run_fill_policy: fill_immediately
-  force_test_order_enabled: true
+  force_test_order_enabled: false
   force_test_order_symbol: ETHUSDT
   force_test_order_qty: 0.011
   force_test_order_premium_bps: 10
@@ -310,28 +325,3 @@ feature_state:
   min_ready_bars: 168
   max_symbols: 200
   update_on_candle: true
-
-# Phase 5.4 — Position Management / Portfolio State
-portfolio:
-  enabled: true
-  snapshot_interval_s: 5
-  exit_check_interval_s: 1
-  reconciliation:
-    enabled: true
-    fail_closed_on_error: true
-    adopt_exchange_positions: true
-    cancel_unknown_open_orders: false
-    flatten_unknown_positions: false
-  exits:
-    enabled: true
-    take_profit_pct: 0.20
-    stop_loss_pct: 0.06
-    max_hold_hours: 24
-    trailing_stop_pct: 0.05
-    trailing_stop_activation_pct: 0.08
-    partial_take_profit_pct: 0.10
-    partial_take_profit_fraction: 0.50
-    time_stop_hours: null
-    time_stop_min_return_pct: 0.01
-    exit_tif: IOC
-    exit_slippage_pct: 0.01

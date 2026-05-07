@@ -1,5 +1,7 @@
 import asyncio
 import logging
+import os
+import re
 import time
 import httpx
 from typing import Any, Dict, Set
@@ -27,8 +29,6 @@ from tradarbot.storage.sqlite_store import SQLiteStore
 from tradarbot.strategies.algo2_micro_momentum import Algo2MicroMomentum
 from tradarbot.strategies.algo1_new_listing_pump import Algo1NewListingPump
 from tradarbot.strategies.ml_strategy import MLStrategy
-from tradarbot.portfolio.reconcile import PortfolioReconciler
-from tradarbot.portfolio.exits import ExitManager
 
 
 pd.set_option('future.no_silent_downcasting', True)
@@ -37,6 +37,34 @@ warnings.filterwarnings(
     message="Downcasting object dtype arrays on .fillna",
     category=FutureWarning,
 )
+
+_ENV_PATTERN = re.compile(r"\$\{([^}:]+)(?::-([^}]*))?\}")
+
+
+def _expand_env_vars(raw: str) -> str:
+    def repl(match: re.Match[str]) -> str:
+        name = match.group(1)
+        default = match.group(2) if match.group(2) is not None else ""
+        return os.environ.get(name, default)
+    return _ENV_PATTERN.sub(repl, raw)
+
+
+def load_runtime_config() -> Dict[str, Any]:
+    config_path = os.environ.get("TRADAR_CONFIG", "config/tradar.yaml")
+    with open(config_path, "r") as fh:
+        cfg = yaml.safe_load(_expand_env_vars(fh.read())) or {}
+
+    runtime = cfg.setdefault("runtime", {})
+    runtime["profile"] = os.environ.get("TRADAR_PROFILE", runtime.get("profile", "paper"))
+    if os.environ.get("TRADAR_LOG_LEVEL"):
+        runtime["log_level"] = os.environ["TRADAR_LOG_LEVEL"]
+    if os.environ.get("TRADAR_DB_PATH"):
+        runtime["db_path"] = os.environ["TRADAR_DB_PATH"]
+    if os.environ.get("TRADAR_DATA_DIR"):
+        runtime["data_dir"] = os.environ["TRADAR_DATA_DIR"]
+    if os.environ.get("TRADAR_ARTIFACT_DIR"):
+        runtime["artifact_dir"] = os.environ["TRADAR_ARTIFACT_DIR"]
+    return cfg
 
 def setup_logging(level: str) -> None:
     numeric = getattr(logging, level.upper(), logging.INFO)
@@ -47,7 +75,7 @@ def setup_logging(level: str) -> None:
 
 
 async def main() -> None:
-    cfg: Dict[str, Any] = yaml.safe_load(open("config/tradar.yaml", "r"))
+    cfg: Dict[str, Any] = load_runtime_config()
     setup_logging(cfg.get("runtime", {}).get("log_level", "INFO"))
     log = logging.getLogger("tradarbot")
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -55,7 +83,7 @@ async def main() -> None:
 
     # Core components
     state = State()
-    store = SQLiteStore("tradarbot.db")
+    store = SQLiteStore(str(cfg.get("runtime", {}).get("db_path", "tradarbot.db")))
     store.init_schema()
 
     exec_live_cfg = cfg.get("execution_live", {})
@@ -70,18 +98,6 @@ async def main() -> None:
     risk = RiskManager(cfg)
 
     ctx = Ctx(cfg=cfg, state=state, store=store, broker=broker, risk=risk)
-
-    # Phase 5.4: reconcile local/exchange portfolio state before strategies trade.
-    if bool(cfg.get("portfolio", {}).get("enabled", True)):
-        try:
-            reconciler = PortfolioReconciler(cfg, store, broker)
-            reconciliation_result = reconciler.reconcile_startup(ctx)
-            ctx.state.set_reconciliation_result(reconciliation_result)
-        except Exception:
-            log.exception("RECONCILE_STARTUP_FAILED")
-            if bool(cfg.get("portfolio", {}).get("reconciliation", {}).get("fail_closed_on_error", True)):
-                ctx.state.portfolio_fail_closed = True
-
 
     feature_cfg = cfg.get("feature_state", {}) or {}
     if bool(feature_cfg.get("enabled", True)):
@@ -123,7 +139,6 @@ async def main() -> None:
     log.info("loaded strategies=%s", [s.name for s in strategies])
 
     engine = StrategyEngine(strategies=strategies, risk=risk, broker=broker, ctx=ctx)
-    exit_manager = ExitManager.from_config(cfg)
 
     # Route events
     def on_candle_event(ev: CandleEvent):
@@ -333,35 +348,6 @@ async def main() -> None:
             await asyncio.sleep(interval)
 
 
-    async def portfolio_exit_loop():
-        interval_s = float(cfg.get("portfolio", {}).get("exit_check_interval_s", 1.0) or 1.0)
-        while True:
-            try:
-                now_ts_ms = int(time.time() * 1000)
-                if hasattr(broker, "sync_state_positions"):
-                    broker.sync_state_positions(ctx)
-                decisions = exit_manager.evaluate_all(getattr(ctx.state, "live_positions", {}) or {}, ctx.state, now_ts_ms)
-                routed = 0
-                for decision in decisions:
-                    if not decision.should_exit:
-                        continue
-                    if hasattr(broker, "has_open_exit_order") and broker.has_open_exit_order(decision.symbol):
-                        log.info("EXIT_MANAGER skip_duplicate_exit symbol=%s reason=%s", decision.symbol, decision.reason)
-                        continue
-                    intent = exit_manager.to_order_intent(decision)
-                    if intent is None:
-                        continue
-                    log.info("EXIT_SIGNAL symbol=%s qty=%.8f limit_px=%.8f reason=%s partial=%s", decision.symbol, decision.qty, decision.limit_px, decision.reason, decision.partial)
-                    engine._handle_strategy_outputs([intent], "portfolio_exit_manager")
-                    routed += 1
-                if hasattr(broker, "persist_position_snapshots"):
-                    broker.persist_position_snapshots(ctx)
-                log.info("EXIT_MANAGER checked positions=%d decisions=%d routed=%d", len(getattr(ctx.state, "live_positions", {}) or {}), len(decisions), routed)
-            except Exception:
-                log.exception("EXIT_MANAGER_FAILED")
-            await asyncio.sleep(interval_s)
-
-
     async def status_loop():
         while True:
             sym_count = len(getattr(ctx.state, "active_symbols", set()))
@@ -384,10 +370,6 @@ async def main() -> None:
                 getattr(ctx.state, "_poll_err", 0),
                 getattr(ctx.state, "_poll_backoff_s", 0.0),
             )
-            if hasattr(broker, "sync_state_positions"):
-                broker.sync_state_positions(ctx)
-            if hasattr(risk, "update_from_portfolio_snapshot") and getattr(ctx.state, "portfolio_snapshot", None):
-                risk.update_from_portfolio_snapshot(ctx.state.portfolio_snapshot)
             ctx.store.insert_equity_snapshot(
                 ts_ms=int(time.time() * 1000),
                 cash=broker.cash,
@@ -402,7 +384,6 @@ async def main() -> None:
     tasks = [
         asyncio.create_task(bus.run(), name="event_bus"),
         asyncio.create_task(status_loop(), name="status"),
-        asyncio.create_task(portfolio_exit_loop(), name="portfolio_exit"),
     ]
 
     md_mode = str(market_data_cfg.get("mode", cfg.get("data_source", "rest_poll")) or "rest_poll").lower()

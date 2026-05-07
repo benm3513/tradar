@@ -54,3 +54,42 @@ backtests/
 *.db
 config/*.phase5_*
 artifacts/
+# Secrets / environment
+.env
+.env.*
+!.env.example
+deploy/*.env
+/etc/tradar/tradar.env
+
+# SQLite runtime DB files
+*.db
+*.sqlite
+*.sqlite3
+*.db-wal
+*.db-shm
+*.db-journal
+tradarbot.db
+tradarbot_backup_*.db
+
+# Runtime data / logs
+data/
+logs/
+*.log
+phase*_*.log
+
+# Model artifacts - mount/store externally unless intentionally versioning
+artifacts/
+
+# Python/cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# macOS/editor
+.DS_Store
+.vscode/
+.idea/

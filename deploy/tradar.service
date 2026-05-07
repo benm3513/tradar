@@ -1,0 +1,23 @@
+[Unit]
+Description=Tradar crypto trading bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tradar
+Group=tradar
+WorkingDirectory=/opt/tradar
+EnvironmentFile=/etc/tradar/tradar.env
+Environment=PYTHONPATH=/opt/tradar
+ExecStartPre=/opt/tradar/.venv/bin/python /opt/tradar/deploy/healthcheck.py --config /opt/tradar/config/tradar.yaml
+ExecStart=/opt/tradar/.venv/bin/python /opt/tradar/run.py --config /opt/tradar/config/tradar.yaml --profile paper
+Restart=always
+RestartSec=10
+KillSignal=SIGINT
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
