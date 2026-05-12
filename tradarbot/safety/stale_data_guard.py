@@ -249,33 +249,22 @@ class StaleDataGuard:
         if symbol is not None:
             violations = [v for v in violations if v.symbol in {None, symbol}]
         return any(v.severity in {"SAFE_MODE", "KILL_SWITCH"} for v in violations)
+    
+    def entry_violations(self, symbol: str):
+        """
+        Runtime compatibility helper for app/main.py.
+        Returns active violations relevant to a symbol.
+        """
+        try:
+            violations = self.check_symbol(symbol)
+        except Exception:
+            violations = []
 
-    def snapshot(
-        self,
-        symbols: Optional[Iterable[str]] = None,
-        *,
-        now_ms: Optional[int] = None,
-        require_feature: bool = False,
-        require_prediction: bool = False,
-        require_book: bool = False,
-        require_ws_heartbeat: bool = False,
-        **kwargs: Any,
-    ) -> StaleDataSnapshot:
-        # Runtime compatibility: main.py calls snapshot(symbols=symbols).
-        # Run a lightweight check before returning the snapshot so stale_symbols
-        # and violations reflect the requested runtime universe.
-        if symbols is not None or require_ws_heartbeat:
-            self.check(
-                symbols=symbols,
-                now_ms=now_ms,
-                require_feature=require_feature,
-                require_prediction=require_prediction,
-                require_book=require_book,
-                require_ws_heartbeat=require_ws_heartbeat,
-            )
+        return list(violations or [])
 
+    def snapshot(self) -> StaleDataSnapshot:
         return StaleDataSnapshot(
-            ts_ms=self.now_ms() if now_ms is None else int(now_ms),
+            ts_ms=self.now_ms(),
             enabled=self.enabled,
             stale_global=self.stale_global,
             stale_symbols=sorted(self.stale_symbols),
