@@ -47,7 +47,7 @@ Thumbs.db
 pip-wheel-metadata/
 config/local.yaml
 config/*.local.yaml
-data/
+
 backtests/
 *.db-wal
 *.db-shm
@@ -72,7 +72,7 @@ tradarbot.db
 tradarbot_backup_*.db
 
 # Runtime data / logs
-data/
+
 logs/
 *.log
 phase*_*.log
