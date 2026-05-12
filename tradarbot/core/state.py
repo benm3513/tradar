@@ -105,6 +105,48 @@ class State:
         self.ws_health: Dict[str, Any] = {}
         self.rest_health: Dict[str, Any] = {}
 
+        # -------------------------
+        # Phase 5.6 runtime safety state
+        # -------------------------
+        self.runtime_safe_mode: bool = False
+        self.runtime_kill_switch: bool = False
+        self.runtime_health_status: str = "OK"
+        self.runtime_health_messages: List[str] = []
+        self.stale_symbols: List[str] = []
+        self.stale_global: bool = False
+
+        self.api_error_counts: int = 0
+        self.order_rejection_counts: int = 0
+        self.ws_disconnect_counts: int = 0
+        self.prediction_error_counts: int = 0
+        self.fallback_prediction_counts: int = 0
+
+        self.last_market_data_ts_ms: Optional[int] = None
+        self.last_book_ts_ms: Optional[int] = None
+        self.last_candle_ts_ms: Optional[int] = None
+        self.last_feature_update_ts_ms: Optional[int] = None
+        self.last_prediction_ts_ms: Optional[int] = None
+        self.last_healthcheck_ts_ms: Optional[int] = None
+        self.last_safety_snapshot: Dict[str, Any] = {}
+
+    def set_runtime_safety_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        self.last_safety_snapshot = dict(snapshot or {})
+        self.runtime_safe_mode = bool(snapshot.get("safe_mode", self.runtime_safe_mode))
+        self.runtime_kill_switch = bool(snapshot.get("kill_switch", self.runtime_kill_switch))
+        if snapshot.get("health_status") is not None:
+            self.runtime_health_status = str(snapshot.get("health_status"))
+        if snapshot.get("health_messages") is not None:
+            self.runtime_health_messages = list(snapshot.get("health_messages") or [])
+        if snapshot.get("stale_symbols") is not None:
+            self.stale_symbols = list(snapshot.get("stale_symbols") or [])
+        if snapshot.get("stale_global") is not None:
+            self.stale_global = bool(snapshot.get("stale_global"))
+
+    def increment_safety_counter(self, name: str, amount: int = 1) -> None:
+        attr = f"{name}_counts" if not name.endswith("_counts") else name
+        current = int(getattr(self, attr, 0) or 0)
+        setattr(self, attr, current + int(amount))
+
     @staticmethod
     def market_state_factory() -> MarketState:
         return MarketState()

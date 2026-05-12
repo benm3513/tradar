@@ -78,6 +78,9 @@ class StrategyEngine:
                     intent.symbol,
                     decision.get("reason"),
                 )
+                state = getattr(self.ctx, "state", None)
+                if state is not None:
+                    state.order_rejection_counts = int(getattr(state, "order_rejection_counts", 0) or 0) + 1
                 self._publish_rejection_signal(item=item, strat_name=strat_name, reason=decision.get("reason"))
                 continue
 

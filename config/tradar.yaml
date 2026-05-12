@@ -37,7 +37,6 @@ runtime:
   data_dir: ${TRADAR_DATA_DIR:-.}
   db_path: ${TRADAR_DB_PATH:-tradarbot.db}
   artifact_dir: ${TRADAR_ARTIFACT_DIR:-artifacts/models/v50_sig_importance}
-
 deployment:
   enabled: true
   service_name: tradar
@@ -293,20 +292,12 @@ execution_live:
   force_test_auto_exit_enabled: false
   force_test_auto_exit_delay_s: 15
   force_test_auto_exit_discount_bps: 10
-  # Unified sizing safeguards: strategy, router, and broker all use these
-  # buffers to avoid tiny precision/available-balance rejects.
   cash_order_buffer: 0.995
   position_qty_buffer: 0.995
   order_notional_buffer: 0.995
-
-  # Broker/orderable universe for Alpaca paper. Keep Binance data universe broad,
-  # but only let MLStrategy submit orders for assets Alpaca can trade.
   tradable_symbols:
-    - BTCUSDT
-    - ETHUSDT
-
-  # Shutdown flattening should be marketable. A SELL at exactly bid can cancel
-  # before Alpaca accepts the IOC if the quote moves. Use an aggressive limit.
+  - BTCUSDT
+  - ETHUSDT
   close_all_tif: IOC
   close_all_price_mode: aggressive_limit
   close_all_slippage_pct: 0.01
@@ -325,3 +316,44 @@ feature_state:
   min_ready_bars: 168
   max_symbols: 200
   update_on_candle: true
+safety:
+  enabled: true
+  health_loop_interval_s: 5.0
+  kill_switch:
+    enabled: true
+    max_drawdown_pct: 0.1
+    max_daily_loss_usd: 5000
+    flatten_positions_on_trigger: false
+    allow_exit_orders: true
+    max_api_errors_per_minute: 25
+    max_order_rejections_per_minute: 20
+    stale_data_kill_seconds: 300
+  safe_mode:
+    enabled: true
+    drawdown_warn_pct: 0.05
+    size_multiplier: 0.5
+    max_positions_multiplier: 0.5
+    cooldown_minutes_multiplier: 2.0
+    disable_ml_entries: false
+    disable_new_entries: false
+    auto_recover: true
+    recover_after_minutes: 30
+  stale_data:
+    enabled: true
+    max_candle_age_seconds: 120
+    max_feature_age_seconds: 300
+    max_prediction_age_seconds: 300
+    max_book_age_seconds: 30
+    max_ws_heartbeat_age_seconds: 60
+  health:
+    enabled: true
+    api_error_warn_threshold: 10
+    api_error_kill_threshold: 25
+    ws_disconnect_warn_threshold: 5
+    ws_disconnect_kill_threshold: 20
+    prediction_error_warn_threshold: 10
+    prediction_error_kill_threshold: 25
+    order_rejection_warn_threshold: 10
+    order_rejection_kill_threshold: 20
+    fallback_prediction_warn_threshold: 5
+    fallback_prediction_kill_threshold: 25

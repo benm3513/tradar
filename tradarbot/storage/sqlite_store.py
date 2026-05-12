@@ -1,5 +1,6 @@
 import json
 import sqlite3
+import time
 from typing import Any, Dict, Optional
 
 from tradarbot.core.events import CandleEvent
@@ -180,6 +181,42 @@ class SQLiteStore:
           errors_json TEXT
         );
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS safety_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          event_type TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          source TEXT,
+          symbol TEXT,
+          message TEXT,
+          details_json TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_health (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          safe_mode INTEGER NOT NULL,
+          kill_switch INTEGER NOT NULL,
+          stale_symbols TEXT,
+          api_errors INTEGER DEFAULT 0,
+          ws_disconnects INTEGER DEFAULT 0,
+          prediction_errors INTEGER DEFAULT 0,
+          details_json TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS safety_state_snapshots (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          safe_mode INTEGER NOT NULL,
+          kill_switch INTEGER NOT NULL,
+          reasons_json TEXT,
+          metadata_json TEXT
+        );
+        """)
         self.conn.commit()
 
     def insert_candle(self, ev: CandleEvent) -> None:
@@ -344,3 +381,72 @@ class SQLiteStore:
         if value is None:
             return None
         return int(bool(value))
+
+
+    def insert_safety_event(self, event_type: str, severity: str, source: str = None, symbol: str = None, message: str = None, details: Optional[Dict[str, Any]] = None, ts_ms: Optional[int] = None) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO safety_events (ts_ms, event_type, severity, source, symbol, message, details_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(ts_ms or time.time() * 1000),
+                str(event_type),
+                str(severity),
+                source,
+                symbol,
+                message,
+                json.dumps(details or {}, sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def insert_runtime_health(self, status: str, safe_mode: bool, kill_switch: bool, stale_symbols=None, api_errors: int = 0, ws_disconnects: int = 0, prediction_errors: int = 0, details: Optional[Dict[str, Any]] = None, ts_ms: Optional[int] = None) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO runtime_health (ts_ms, status, safe_mode, kill_switch, stale_symbols, api_errors, ws_disconnects, prediction_errors, details_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(ts_ms or time.time() * 1000),
+                str(status),
+                1 if safe_mode else 0,
+                1 if kill_switch else 0,
+                json.dumps(list(stale_symbols or []), sort_keys=True),
+                int(api_errors or 0),
+                int(ws_disconnects or 0),
+                int(prediction_errors or 0),
+                json.dumps(details or {}, sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def insert_safety_snapshot(self, safe_mode: bool, kill_switch: bool, reasons=None, metadata: Optional[Dict[str, Any]] = None, ts_ms: Optional[int] = None) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO safety_state_snapshots (ts_ms, safe_mode, kill_switch, reasons_json, metadata_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                int(ts_ms or time.time() * 1000),
+                1 if safe_mode else 0,
+                1 if kill_switch else 0,
+                json.dumps(list(reasons or []), sort_keys=True),
+                json.dumps(metadata or {}, sort_keys=True),
+            ),
+        )
+        self.conn.commit()
+
+    def latest_safety_snapshot(self) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            "SELECT ts_ms, safe_mode, kill_switch, reasons_json, metadata_json FROM safety_state_snapshots ORDER BY ts_ms DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "ts_ms": row[0],
+            "safe_mode": bool(row[1]),
+            "kill_switch": bool(row[2]),
+            "reasons": json.loads(row[3] or "[]"),
+            "metadata": json.loads(row[4] or "{}"),
+        }

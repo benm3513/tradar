@@ -29,6 +29,10 @@ from tradarbot.storage.sqlite_store import SQLiteStore
 from tradarbot.strategies.algo2_micro_momentum import Algo2MicroMomentum
 from tradarbot.strategies.algo1_new_listing_pump import Algo1NewListingPump
 from tradarbot.strategies.ml_strategy import MLStrategy
+from tradarbot.safety.kill_switch import KillSwitchManager, KillSwitchReason
+from tradarbot.safety.safe_mode import SafeModeManager
+from tradarbot.safety.stale_data_guard import StaleDataGuard
+from tradarbot.safety.health_rules import HealthMonitor, STATUS_KILL_SWITCH, STATUS_SAFE_MODE
 
 
 pd.set_option('future.no_silent_downcasting', True)
@@ -97,7 +101,36 @@ async def main() -> None:
         )
     risk = RiskManager(cfg)
 
+    # Phase 5.6 safety layer
+    kill_switch = KillSwitchManager(cfg, store=store)
+    safe_mode = SafeModeManager(cfg, store=store)
+    stale_guard = StaleDataGuard(cfg, store=store)
+    health_monitor = HealthMonitor(cfg, store=store, stale_guard=stale_guard)
+    risk.attach_safety(
+        kill_switch_manager=kill_switch,
+        safe_mode_manager=safe_mode,
+        health_monitor=health_monitor,
+        stale_data_guard=stale_guard,
+    )
+
     ctx = Ctx(cfg=cfg, state=state, store=store, broker=broker, risk=risk)
+    ctx.kill_switch = kill_switch
+    ctx.safe_mode = safe_mode
+    ctx.stale_guard = stale_guard
+    ctx.health_monitor = health_monitor
+
+    previous_safety = store.latest_safety_snapshot() if hasattr(store, "latest_safety_snapshot") else None
+    if previous_safety and bool(previous_safety.get("kill_switch")):
+        kill_switch.activate(KillSwitchReason.STARTUP_FAIL_CLOSED, message="previous runtime ended with kill switch active", metadata=previous_safety)
+    elif previous_safety and bool(previous_safety.get("safe_mode")):
+        safe_mode.activate("startup_previous_safe_mode", message="previous runtime ended in safe mode", metadata=previous_safety)
+
+    state.set_runtime_safety_snapshot({
+        "safe_mode": safe_mode.is_active(),
+        "kill_switch": kill_switch.is_active(),
+        "health_status": "OK",
+        "health_messages": [],
+    })
 
     feature_cfg = cfg.get("feature_state", {}) or {}
     if bool(feature_cfg.get("enabled", True)):
@@ -321,6 +354,7 @@ async def main() -> None:
 
                 except httpx.HTTPStatusError as e:
                     ctx.state._poll_err += 1
+                    ctx.state.api_error_counts = int(getattr(ctx.state, "api_error_counts", 0) or 0) + 1
                     status = e.response.status_code if e.response is not None else None
                     if status in (418, 429):
                         any_429 = True
@@ -332,6 +366,7 @@ async def main() -> None:
 
                 except Exception as e:
                     ctx.state._poll_err += 1
+                    ctx.state.api_error_counts = int(getattr(ctx.state, "api_error_counts", 0) or 0) + 1
                     now = time.time()
                     if now - last_err_log > 5:
                         log.warning("REST poll failed symbol=%s err=%s", s, e)
@@ -381,9 +416,53 @@ async def main() -> None:
             await asyncio.sleep(5)
 
 
+    async def safety_loop():
+        interval_s = float(cfg.get("safety", {}).get("health_loop_interval_s", 5.0) or 5.0)
+        while True:
+            try:
+                symbols = sorted(getattr(ctx.state, "active_symbols", set()) or [])
+                stale_snapshot = stale_guard.snapshot(symbols=symbols)
+                ctx.state.stale_symbols = list(stale_snapshot.stale_symbols)
+                ctx.state.stale_global = bool(stale_snapshot.stale_global)
+
+                results = health_monitor.evaluate(ctx)
+                worst = health_monitor.worst_status(results)
+                if worst == STATUS_KILL_SWITCH:
+                    kill_switch.activate(KillSwitchReason.HEALTH_RULE, metadata={"health": [r.to_dict() for r in results]})
+                elif worst == STATUS_SAFE_MODE:
+                    safe_mode.activate("health_rule", metadata={"health": [r.to_dict() for r in results]})
+                else:
+                    safe_mode.maybe_auto_recover()
+
+                if kill_switch.is_active() and kill_switch.flatten_positions_on_trigger and hasattr(broker, "close_all"):
+                    try:
+                        broker.close_all(ctx, reason="kill_switch")
+                    except TypeError:
+                        broker.close_all(ctx)
+
+                ctx.state.set_runtime_safety_snapshot({
+                    "safe_mode": safe_mode.is_active(),
+                    "kill_switch": kill_switch.is_active(),
+                    "health_status": worst,
+                    "health_messages": health_monitor.messages(results),
+                    "stale_symbols": stale_snapshot.stale_symbols,
+                    "stale_global": stale_snapshot.stale_global,
+                })
+                store.insert_safety_snapshot(
+                    safe_mode=safe_mode.is_active(),
+                    kill_switch=kill_switch.is_active(),
+                    reasons=list(kill_switch.active_reasons()) + list(safe_mode.state.reasons),
+                    metadata={"health_status": worst, "stale_symbols": stale_snapshot.stale_symbols},
+                )
+            except Exception:
+                log.exception("SAFETY_LOOP_FAILED")
+                safe_mode.activate("safety_loop_failed")
+            await asyncio.sleep(interval_s)
+
     tasks = [
         asyncio.create_task(bus.run(), name="event_bus"),
         asyncio.create_task(status_loop(), name="status"),
+        asyncio.create_task(safety_loop(), name="safety"),
     ]
 
     md_mode = str(market_data_cfg.get("mode", cfg.get("data_source", "rest_poll")) or "rest_poll").lower()
@@ -465,6 +544,12 @@ def _on_candle_for_feature_state(ctx: Ctx, bus: EventBus, ev: CandleEvent) -> No
         return
 
     feature_state.update_candle(ev)
+    stale_guard = getattr(ctx, "stale_guard", None)
+    if stale_guard is not None:
+        stale_guard.update_candle(ev.symbol, int(ev.ts_ms))
+        stale_guard.update_feature(ev.symbol, int(ev.ts_ms))
+    ctx.state.last_candle_ts_ms = int(ev.ts_ms)
+    ctx.state.last_feature_update_ts_ms = int(ev.ts_ms)
     health = feature_state.health_snapshot()
     ready = feature_state.ready_symbols()
     health["ready_symbol_list"] = ready
@@ -521,6 +606,13 @@ def _on_book(ctx: Ctx, candle_builder, book_event) -> None:
 
     # Persist latest book snapshot (optional)
     ctx.store.upsert_book(book_event.symbol, book_event.ts_ms, book_event.bid, book_event.ask)
+
+    stale_guard = getattr(ctx, "stale_guard", None)
+    if stale_guard is not None:
+        stale_guard.update_book(book_event.symbol, int(book_event.ts_ms))
+        stale_guard.update_ws_heartbeat(int(book_event.ts_ms))
+    ctx.state.last_market_data_ts_ms = int(book_event.ts_ms)
+    ctx.state.last_book_ts_ms = int(book_event.ts_ms)
 
     ctx.state.market_data_health = {
         "last_book_ts_ms": int(book_event.ts_ms),

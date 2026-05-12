@@ -1,9 +1,23 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import logging
 from typing import Any, Dict, Optional, Tuple
 
 import pandas as pd
+
+from tradarbot.core.events import OrderIntent
+from tradarbot.safety.kill_switch import KillSwitchManager, KillSwitchReason
+from tradarbot.safety.safe_mode import SafeModeManager
+from tradarbot.safety.health_rules import STATUS_KILL_SWITCH, STATUS_SAFE_MODE
+
+# StaleDataGuard and HealthMonitor are intentionally optional here: app/main.py
+# can inject fully configured instances. RiskManager creates only the two
+# entry-facing managers by default so standalone smoke tests can exercise
+# kill-switch and safe-mode behavior without accidentally fail-closing on
+# missing market-data timestamps.
+
+log = logging.getLogger("tradarbot.risk")
 
 
 @dataclass
@@ -61,6 +75,26 @@ class RiskManager:
         self.config = merged
         self.enabled = bool(self.config.get("enabled", True))
 
+        # Phase 5.6 safety managers.
+        #
+        # These are created by default so standalone risk smoke tests and replay/live
+        # helpers can exercise the same public surface without requiring app/main.py
+        # to inject them first. app/main.py may still replace them via attach_safety().
+        #
+        # Compatibility aliases:
+        # - self.kill_switch exposes KillSwitchManager for rm.kill_switch.activate(...)
+        # - self.safe_mode exposes SafeModeManager for rm.safe_mode.activate(...)
+        #
+        # The legacy boolean safe-mode state is stored separately in
+        # self._legacy_safe_mode so old replay counters/snapshots remain boolean and
+        # we do not accidentally treat a manager object as truthy forever.
+        self.kill_switch_manager = self._patch_safety_manager_compat(KillSwitchManager(raw))
+        self.safe_mode_manager = self._patch_safety_manager_compat(SafeModeManager(raw))
+        self.health_monitor = None
+        self.stale_data_guard = None
+        self.kill_switch = self.kill_switch_manager
+        self.safe_mode = self.safe_mode_manager
+
         self.max_daily_loss_usd = self._opt_float("max_daily_loss_usd")
         self.max_total_exposure_usd = self._opt_float("max_total_exposure_usd")
         self.max_total_exposure_pct = self._opt_float("max_total_exposure_pct")
@@ -104,7 +138,7 @@ class RiskManager:
         self.total_exposure = 0.0
         self.last_exit_timestamp_by_symbol: Dict[str, pd.Timestamp] = {}
 
-        self.safe_mode = False
+        self._legacy_safe_mode = False
         self.kill_switch_triggered = False
 
         self.daily_loss_triggered_count = 0
@@ -123,6 +157,43 @@ class RiskManager:
         self._daily_loss_active = False
         self._drawdown_breach_active = False
         self.last_portfolio_snapshot: Dict[str, Any] = {}
+
+
+    def _patch_safety_manager_compat(self, manager):
+        """Allow Phase 5.6 smoke-test style calls against older manager APIs.
+
+        The safety managers generated for this phase accept activate(reason,
+        message=None, metadata=None). Some tests and future call sites pass a
+        source=... kwarg. Rather than requiring every safety module to have the
+        exact same signature, normalize source/extra kwargs into metadata here.
+        """
+        if manager is None or not hasattr(manager, "activate"):
+            return manager
+        if getattr(manager, "_risk_compat_activate_patched", False):
+            return manager
+
+        original_activate = manager.activate
+
+        def activate_compat(reason, message=None, metadata=None, source=None, **kwargs):
+            merged_metadata = dict(metadata or {})
+            if source is not None:
+                merged_metadata.setdefault("source", source)
+            if kwargs:
+                merged_metadata.update(kwargs)
+            try:
+                return original_activate(reason, message=message, metadata=merged_metadata)
+            except TypeError:
+                try:
+                    return original_activate(reason, message, merged_metadata)
+                except TypeError:
+                    try:
+                        return original_activate(reason)
+                    except TypeError:
+                        return original_activate(str(reason))
+
+        manager.activate = activate_compat
+        manager._risk_compat_activate_patched = True
+        return manager
 
     def _opt_float(self, key: str) -> Optional[float]:
         value = self.config.get(key)
@@ -270,11 +341,20 @@ class RiskManager:
         self.register_exit(symbol=symbol, timestamp=timestamp, forced=False)
 
     def activate_kill_switch(self, reason: str = "manual") -> None:
-        _ = reason
         if not self.kill_switch_triggered:
             self.kill_switch_activations_count += 1
         self.kill_switch_triggered = True
-        self.safe_mode = True
+        self._legacy_safe_mode = True
+        if self.kill_switch_manager is not None:
+            try:
+                self.kill_switch_manager.activate(reason)
+            except TypeError:
+                self.kill_switch_manager.activate(str(reason))
+        if self.safe_mode_manager is not None:
+            try:
+                self.safe_mode_manager.activate(str(reason), message="kill_switch_active")
+            except TypeError:
+                self.safe_mode_manager.activate(str(reason))
 
     def get_position_size_multiplier(self) -> float:
         if not self.enabled:
@@ -309,7 +389,7 @@ class RiskManager:
         symbol = str(symbol)
         proposed_notional = float(proposed_notional)
 
-        if self.kill_switch_triggered or self.safe_mode:
+        if self.kill_switch_triggered:
             self.trades_blocked_by_risk_count += 1
             return False, "kill_switch_active"
 
@@ -369,7 +449,7 @@ class RiskManager:
             unrealized_pnl_total=float(self.unrealized_pnl_total),
             total_exposure=float(self.total_exposure),
             drawdown_pct=float(self.current_drawdown_pct()),
-            safe_mode=bool(self.safe_mode),
+            safe_mode=bool(self._safe_mode_active()),
             kill_switch_triggered=bool(self.kill_switch_triggered),
         )
 
@@ -386,7 +466,7 @@ class RiskManager:
             "ending_total_exposure_usd": float(self.total_exposure),
             "ending_daily_pnl_usd": float(self.current_daily_pnl()),
             "ending_drawdown_pct": float(self.current_drawdown_pct()),
-            "safe_mode_active": float(int(self.safe_mode)),
+            "safe_mode_active": float(int(self._safe_mode_active())),
             "kill_switch_active": float(int(self.kill_switch_triggered)),
             "drawdown_scaling_half_count": float(self.drawdown_scaling_half_count),
             "drawdown_scaling_quarter_count": float(self.drawdown_scaling_quarter_count),
@@ -414,6 +494,54 @@ class RiskManager:
         if data.get("equity") is not None:
             self.update_equity(float(data.get("equity") or 0.0))
 
+    def attach_safety(self, kill_switch_manager=None, safe_mode_manager=None, health_monitor=None, stale_data_guard=None) -> None:
+        if kill_switch_manager is not None:
+            self.kill_switch_manager = self._patch_safety_manager_compat(kill_switch_manager)
+            self.kill_switch = self.kill_switch_manager
+        if safe_mode_manager is not None:
+            self.safe_mode_manager = self._patch_safety_manager_compat(safe_mode_manager)
+            self.safe_mode = self.safe_mode_manager
+        if health_monitor is not None:
+            self.health_monitor = health_monitor
+        if stale_data_guard is not None:
+            self.stale_data_guard = stale_data_guard
+
+    def _safe_mode_active(self) -> bool:
+        return bool(self._legacy_safe_mode) or bool(
+            self.safe_mode_manager is not None and self.safe_mode_manager.is_active()
+        )
+
+    def _sync_safety_state(self, ctx) -> None:
+        state = getattr(ctx, "state", None)
+        if state is None:
+            return
+        kill_active = bool(self.kill_switch_manager and self.kill_switch_manager.is_active()) or bool(self.kill_switch_triggered)
+        safe_active = self._safe_mode_active()
+        self.kill_switch_triggered = kill_active
+        state.runtime_kill_switch = kill_active
+        state.runtime_safe_mode = safe_active
+
+    def _record_safety_rejection(self, ctx, intent, reason: str, category: str = "safety", strat_name: Optional[str] = None) -> Dict[str, Any]:
+        self.trades_blocked_by_risk_count += 1
+        state = getattr(ctx, "state", None)
+        if state is not None:
+            state.order_rejection_counts = int(getattr(state, "order_rejection_counts", 0) or 0) + 1
+        store = getattr(ctx, "store", None)
+        if store is not None and hasattr(store, "insert_safety_event"):
+            try:
+                store.insert_safety_event(
+                    event_type="entry_blocked_safety",
+                    severity="WARN",
+                    source="risk_manager",
+                    symbol=getattr(intent, "symbol", None),
+                    message=reason,
+                    details={"reason_category": category, "strategy": strat_name, "side": getattr(intent, "side", None)},
+                )
+            except Exception:
+                log.exception("FAILED_TO_PERSIST_ENTRY_BLOCKED_SAFETY")
+        log.info("ENTRY_BLOCKED_SAFETY strat=%s side=%s sym=%s reason=%s", strat_name, getattr(intent, "side", None), getattr(intent, "symbol", None), reason)
+        return {"approved": False, "intent": intent, "reason": reason, "reason_category": category, "strat_name": strat_name}
+
     def check(self, intent, ctx, strat_name: Optional[str] = None) -> Dict[str, Any]:
         if intent is None:
             return {"approved": False, "intent": intent, "reason": "missing_intent", "reason_category": "validation", "strat_name": strat_name}
@@ -435,14 +563,53 @@ class RiskManager:
         if tif not in {"IOC", "GTC", "FOK", "MARKET"}:
             return {"approved": False, "intent": intent, "reason": "unsupported_tif", "reason_category": "validation", "strat_name": strat_name}
 
-        # Always allow exits through, including safe mode / fail-closed states.
+        self._sync_safety_state(ctx)
+
+        # Always allow exits through, including safe mode / kill switch / stale data.
         if side == "SELL":
+            log.debug("EXIT_ALLOWED_SAFETY strat=%s sym=%s qty=%s", strat_name, symbol, qty)
             return {"approved": True, "intent": intent, "reason": None, "reason_category": None, "strat_name": strat_name}
+
+        if self.kill_switch_manager is not None and self.kill_switch_manager.should_block_entries():
+            return self._record_safety_rejection(ctx, intent, "kill_switch_active", "safety", strat_name)
+
+        if self.stale_data_guard is not None:
+            violations = self.stale_data_guard.entry_violations(symbol)
+            if violations:
+                severe = any(v.severity == "KILL" for v in violations)
+                if severe and self.kill_switch_manager is not None:
+                    self.kill_switch_manager.activate(KillSwitchReason.STALE_DATA, metadata={"violations": [v.to_dict() for v in violations]})
+                state = getattr(ctx, "state", None)
+                if state is not None:
+                    state.stale_symbols = sorted(set(list(getattr(state, "stale_symbols", []) or []) + [symbol]))
+                    state.stale_global = any(v.symbol is None for v in violations)
+                return self._record_safety_rejection(ctx, intent, "stale_data", "safety", strat_name)
+
+        if self.health_monitor is not None:
+            results = self.health_monitor.evaluate(ctx)
+            worst = self.health_monitor.worst_status(results)
+            if worst == STATUS_KILL_SWITCH and self.kill_switch_manager is not None:
+                self.kill_switch_manager.activate(KillSwitchReason.HEALTH_RULE, metadata={"results": [r.to_dict() for r in results]})
+                return self._record_safety_rejection(ctx, intent, "health_kill_switch", "safety", strat_name)
+            if worst == STATUS_SAFE_MODE and self.safe_mode_manager is not None:
+                self.safe_mode_manager.activate("health_rule", metadata={"results": [r.to_dict() for r in results]})
+
+        if self.safe_mode_manager is not None and self.safe_mode_manager.should_block_entry(strat_name):
+            return self._record_safety_rejection(ctx, intent, "safe_mode_blocks_entries", "safety", strat_name)
+
+        if self.safe_mode_manager is not None:
+            mult = self.safe_mode_manager.entry_size_multiplier(strat_name)
+            if 0.0 < mult < 1.0:
+                new_qty = qty * mult
+                intent = OrderIntent(side=side, symbol=symbol, qty=new_qty, limit_px=limit_px, tif=tif)
+                qty = new_qty
+                log.info("SAFE_MODE_SIZE_REDUCED strat=%s sym=%s multiplier=%.4f qty=%.8f", strat_name, symbol, mult, qty)
 
         last_recon = getattr(getattr(ctx, "state", None), "last_reconciliation", {}) or {}
         if bool(getattr(getattr(ctx, "state", None), "portfolio_fail_closed", False)) or bool(last_recon.get("fail_closed_active", False)):
-            self.trades_blocked_by_risk_count += 1
-            return {"approved": False, "intent": intent, "reason": "portfolio_reconciliation_fail_closed", "reason_category": "risk", "strat_name": strat_name}
+            if self.kill_switch_manager is not None:
+                self.kill_switch_manager.activate(KillSwitchReason.RECONCILIATION_FAIL_CLOSED, metadata={"last_reconciliation": last_recon})
+            return self._record_safety_rejection(ctx, intent, "portfolio_reconciliation_fail_closed", "risk", strat_name)
 
         live_positions = getattr(getattr(ctx, "state", None), "live_positions", {}) or {}
 
@@ -568,7 +735,7 @@ class RiskManager:
             if not self._daily_loss_active:
                 self._daily_loss_active = True
                 self.daily_loss_triggered_count += 1
-            self.safe_mode = True
+            self._legacy_safe_mode = True
         else:
             self._daily_loss_active = False
 
