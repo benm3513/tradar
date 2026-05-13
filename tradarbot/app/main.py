@@ -33,6 +33,9 @@ from tradarbot.safety.kill_switch import KillSwitchManager, KillSwitchReason
 from tradarbot.safety.safe_mode import SafeModeManager
 from tradarbot.safety.stale_data_guard import StaleDataGuard
 from tradarbot.safety.health_rules import HealthMonitor, STATUS_KILL_SWITCH, STATUS_SAFE_MODE
+from tradarbot.monitoring.metrics import MetricsCollector
+from tradarbot.monitoring.heartbeat import HeartbeatWriter
+from tradarbot.monitoring.reporting import RuntimeReporter
 
 
 pd.set_option('future.no_silent_downcasting', True)
@@ -118,6 +121,14 @@ async def main() -> None:
     ctx.safe_mode = safe_mode
     ctx.stale_guard = stale_guard
     ctx.health_monitor = health_monitor
+
+    # Phase 5.7 monitoring layer: lightweight, SQLite-backed, failure-isolated.
+    process_start_ts = time.time()
+    monitoring_cfg = cfg.get("monitoring", {}) or {}
+    monitoring_enabled = bool(monitoring_cfg.get("enabled", True))
+    metrics_collector = MetricsCollector(cfg, process_start_ts=process_start_ts)
+    heartbeat_writer = HeartbeatWriter(cfg, process_start_ts=process_start_ts)
+    runtime_reporter = RuntimeReporter(cfg)
 
     previous_safety = store.latest_safety_snapshot() if hasattr(store, "latest_safety_snapshot") else None
     if previous_safety and bool(previous_safety.get("kill_switch")):
@@ -459,10 +470,75 @@ async def main() -> None:
                 safe_mode.activate("safety_loop_failed")
             await asyncio.sleep(interval_s)
 
+    async def monitoring_loop():
+        if not monitoring_enabled:
+            return
+        heartbeat_cfg = monitoring_cfg.get("heartbeat", {}) or {}
+        metrics_cfg = monitoring_cfg.get("metrics", {}) or {}
+        reporting_cfg = monitoring_cfg.get("reporting", {}) or {}
+        heartbeat_enabled = bool(heartbeat_cfg.get("enabled", True))
+        metrics_enabled = bool(metrics_cfg.get("enabled", True))
+        reporting_enabled = bool(reporting_cfg.get("enabled", True))
+        persist_metrics = bool(metrics_cfg.get("persist_metrics", True))
+        heartbeat_interval_s = max(1.0, float(heartbeat_cfg.get("interval_seconds", 15.0) or 15.0))
+        metrics_interval_s = max(1.0, float(metrics_cfg.get("snapshot_interval_seconds", 30.0) or 30.0))
+        summary_interval_s = max(5.0, float(reporting_cfg.get("summary_interval_seconds", 120.0) or 120.0))
+        last_heartbeat = 0.0
+        last_metrics = 0.0
+        last_summary = 0.0
+        last_snapshot = None
+        heartbeat_writer.event(ctx, "monitoring_started", "INFO", "Phase 5.7 monitoring loop started", {
+            "heartbeat_interval_s": heartbeat_interval_s,
+            "metrics_interval_s": metrics_interval_s,
+            "summary_interval_s": summary_interval_s,
+        })
+        while True:
+            now = time.time()
+            try:
+                if heartbeat_enabled and now - last_heartbeat >= heartbeat_interval_s:
+                    heartbeat_writer.write(ctx, status=getattr(ctx.state, "runtime_health_status", "OK"), details={
+                        "active_symbols": len(getattr(ctx.state, "active_symbols", set()) or []),
+                        "poll_ok": getattr(ctx.state, "_poll_ok", 0),
+                        "poll_err": getattr(ctx.state, "_poll_err", 0),
+                    })
+                    log.info(
+                        "HEARTBEAT_OK profile=%s safe_mode=%s kill_switch=%s health=%s",
+                        cfg.get("runtime", {}).get("profile", "paper"),
+                        getattr(ctx.state, "runtime_safe_mode", False),
+                        getattr(ctx.state, "runtime_kill_switch", False),
+                        getattr(ctx.state, "runtime_health_status", "OK"),
+                    )
+                    last_heartbeat = now
+
+                if metrics_enabled and now - last_metrics >= metrics_interval_s:
+                    snapshot = metrics_collector.collect(ctx, broker=broker)
+                    last_snapshot = snapshot
+                    if persist_metrics and hasattr(store, "insert_runtime_metrics_snapshot"):
+                        store.insert_runtime_metrics_snapshot(snapshot, flattened=metrics_collector.flatten(snapshot))
+                    log.info("METRICS_SNAPSHOT %s", runtime_reporter.compact_status_line(snapshot))
+                    last_metrics = now
+
+                if reporting_enabled and now - last_summary >= summary_interval_s:
+                    snapshot = last_snapshot or metrics_collector.collect(ctx, broker=broker)
+                    summary = runtime_reporter.build_runtime_summary(snapshot)
+                    log.info(runtime_reporter.log_line("RUNTIME_SUMMARY", summary))
+                    log.info(runtime_reporter.log_line("EXECUTION_SUMMARY", summary.get("execution", {})))
+                    log.info(runtime_reporter.log_line("MARKET_DATA_SUMMARY", summary.get("market_data", {})))
+                    log.info(runtime_reporter.log_line("ML_RUNTIME_SUMMARY", summary.get("ml", {})))
+                    last_summary = now
+            except Exception:
+                log.exception("MONITORING_LOOP_FAILED")
+                try:
+                    heartbeat_writer.event(ctx, "monitoring_loop_failed", "WARN", "Monitoring loop failed but runtime continues")
+                except Exception:
+                    pass
+            await asyncio.sleep(1.0)
+
     tasks = [
         asyncio.create_task(bus.run(), name="event_bus"),
         asyncio.create_task(status_loop(), name="status"),
         asyncio.create_task(safety_loop(), name="safety"),
+        asyncio.create_task(monitoring_loop(), name="monitoring"),
     ]
 
     md_mode = str(market_data_cfg.get("mode", cfg.get("data_source", "rest_poll")) or "rest_poll").lower()

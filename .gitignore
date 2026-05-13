@@ -93,3 +93,7 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Runtime monitoring exports
+runtime_metrics.csv
+local_metrics.csv

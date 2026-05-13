@@ -262,7 +262,7 @@ class StaleDataGuard:
 
         return list(violations or [])
 
-    def snapshot(self) -> StaleDataSnapshot:
+    def snapshot(self, symbols = None) -> StaleDataSnapshot:
         return StaleDataSnapshot(
             ts_ms=self.now_ms(),
             enabled=self.enabled,

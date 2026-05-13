@@ -357,3 +357,16 @@ safety:
     order_rejection_kill_threshold: 20
     fallback_prediction_warn_threshold: 5
     fallback_prediction_kill_threshold: 25
+
+monitoring:
+  enabled: true
+  heartbeat:
+    enabled: true
+    interval_seconds: 15
+  metrics:
+    enabled: true
+    snapshot_interval_seconds: 30
+    persist_metrics: true
+  reporting:
+    enabled: true
+    summary_interval_seconds: 120

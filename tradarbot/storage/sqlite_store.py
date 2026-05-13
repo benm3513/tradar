@@ -9,9 +9,16 @@ from tradarbot.portfolio.positions import LivePositionState, PortfolioSnapshot, 
 
 class SQLiteStore:
     def __init__(self, path: str):
+        self.path = path
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA synchronous=NORMAL;")
+
+    def _ensure_column(self, table: str, column: str, ddl: str) -> None:
+        """Add a column if it does not already exist. Keeps schema upgrades additive."""
+        existing = {row[1] for row in self.conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if column not in existing:
+            self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
     def init_schema(self) -> None:
         cur = self.conn.cursor()
@@ -208,6 +215,50 @@ class SQLiteStore:
         );
         """)
         cur.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_heartbeat (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          profile TEXT,
+          status TEXT NOT NULL,
+          pid INTEGER,
+          uptime_seconds REAL,
+          safe_mode INTEGER NOT NULL,
+          kill_switch INTEGER NOT NULL,
+          details_json TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_runtime_heartbeat_ts ON runtime_heartbeat(ts_ms);
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_metrics (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          metric_group TEXT NOT NULL,
+          metric_name TEXT NOT NULL,
+          metric_value REAL,
+          metric_text TEXT,
+          labels_json TEXT
+        );
+        """)
+        self._ensure_column("runtime_metrics", "metric_text", "TEXT")
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_runtime_metrics_lookup ON runtime_metrics(metric_group, metric_name, ts_ms);
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS runtime_status_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          event_type TEXT NOT NULL,
+          severity TEXT NOT NULL,
+          message TEXT,
+          details_json TEXT
+        );
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_runtime_status_events_ts ON runtime_status_events(ts_ms);
+        """)
+        cur.execute("""
         CREATE TABLE IF NOT EXISTS safety_state_snapshots (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           ts_ms INTEGER NOT NULL,
@@ -360,6 +411,265 @@ class SQLiteStore:
         cur = self.conn.execute("SELECT * FROM position_events ORDER BY id DESC LIMIT ?", (int(limit),))
         cols = [c[0] for c in cur.description]
         return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+
+    def insert_runtime_heartbeat(
+        self,
+        *,
+        ts_ms: int,
+        profile: str,
+        status: str,
+        pid: int,
+        uptime_seconds: float,
+        safe_mode: bool,
+        kill_switch: bool,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO runtime_heartbeat(ts_ms, profile, status, pid, uptime_seconds, safe_mode, kill_switch, details_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(ts_ms),
+                str(profile),
+                str(status),
+                int(pid),
+                float(uptime_seconds),
+                1 if safe_mode else 0,
+                1 if kill_switch else 0,
+                self._json(details or {}),
+            ),
+        )
+        self.conn.commit()
+
+    def insert_runtime_metric(
+        self,
+        *,
+        ts_ms: int,
+        metric_group: str,
+        metric_name: str,
+        metric_value: Any = None,
+        labels: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        numeric_value = None
+        text_value = None
+        if isinstance(metric_value, bool):
+            numeric_value = 1.0 if metric_value else 0.0
+        elif isinstance(metric_value, (int, float)):
+            numeric_value = float(metric_value)
+        elif metric_value is not None:
+            text_value = str(metric_value)
+        self.conn.execute(
+            """
+            INSERT INTO runtime_metrics(ts_ms, metric_group, metric_name, metric_value, metric_text, labels_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (int(ts_ms), str(metric_group), str(metric_name), numeric_value, text_value, self._json(labels or {})),
+        )
+        self.conn.commit()
+
+    def insert_runtime_metrics_snapshot(self, snapshot: Dict[str, Any], flattened=None) -> None:
+        rows = []
+
+        def split_metric_value(metric_value):
+            numeric_value = None
+            text_value = None
+            labels = None
+            if isinstance(metric_value, bool):
+                numeric_value = 1.0 if metric_value else 0.0
+            elif isinstance(metric_value, (int, float)):
+                numeric_value = float(metric_value)
+            elif metric_value is not None:
+                if isinstance(metric_value, (dict, list, tuple, set)):
+                    labels = {"value_json": json.dumps(metric_value, sort_keys=True, default=str)}
+                else:
+                    text_value = str(metric_value)
+            return numeric_value, text_value, labels
+
+        if flattened is None:
+            ts_ms = int(snapshot.get("ts_ms") or time.time() * 1000)
+            for metric_group, payload in (snapshot or {}).items():
+                if metric_group == "ts_ms" or not isinstance(payload, dict):
+                    continue
+                for metric_name, metric_value in payload.items():
+                    numeric_value, text_value, labels = split_metric_value(metric_value)
+                    rows.append((ts_ms, str(metric_group), str(metric_name), numeric_value, text_value, self._json(labels or {})))
+        else:
+            for item in flattened:
+                metric_value = item.get("metric_value")
+                numeric_value, text_value, value_labels = split_metric_value(metric_value)
+                labels = dict(item.get("labels") or {})
+                if value_labels:
+                    labels.update(value_labels)
+                rows.append((
+                    int(item.get("ts_ms") or time.time() * 1000),
+                    str(item.get("metric_group")),
+                    str(item.get("metric_name")),
+                    numeric_value,
+                    text_value,
+                    self._json(labels or {}),
+                ))
+        if not rows:
+            return
+        self.conn.executemany(
+            """
+            INSERT INTO runtime_metrics(ts_ms, metric_group, metric_name, metric_value, metric_text, labels_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        self.conn.commit()
+
+    def insert_runtime_status_event(
+        self,
+        *,
+        ts_ms: int,
+        event_type: str,
+        severity: str,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO runtime_status_events(ts_ms, event_type, severity, message, details_json)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (int(ts_ms), str(event_type), str(severity), str(message), self._json(details or {})),
+        )
+        self.conn.commit()
+
+    def latest_runtime_heartbeat(self) -> Optional[Dict[str, Any]]:
+        row = self.conn.execute(
+            """
+            SELECT ts_ms, profile, status, pid, uptime_seconds, safe_mode, kill_switch, details_json
+              FROM runtime_heartbeat
+             ORDER BY ts_ms DESC
+             LIMIT 1
+            """
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "ts_ms": row[0],
+            "profile": row[1],
+            "status": row[2],
+            "pid": row[3],
+            "uptime_seconds": row[4],
+            "safe_mode": bool(row[5]),
+            "kill_switch": bool(row[6]),
+            "details": self._loads(row[7]) or {},
+        }
+
+    def recent_runtime_status_events(self, limit: int = 20):
+        cur = self.conn.execute(
+            """
+            SELECT ts_ms, event_type, severity, message, details_json
+              FROM runtime_status_events
+             ORDER BY ts_ms DESC
+             LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [
+            {"ts_ms": r[0], "event_type": r[1], "severity": r[2], "message": r[3], "details": self._loads(r[4]) or {}}
+            for r in cur.fetchall()
+        ]
+
+    def recent_safety_events(self, limit: int = 20):
+        cur = self.conn.execute(
+            """
+            SELECT ts_ms, event_type, severity, source, symbol, message, details_json
+              FROM safety_events
+             ORDER BY id DESC
+             LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [
+            {"ts_ms": r[0], "event_type": r[1], "severity": r[2], "source": r[3], "symbol": r[4], "message": r[5], "details": self._loads(r[6]) or {}}
+            for r in cur.fetchall()
+        ]
+
+    def recent_fills(self, limit: int = 20):
+        cur = self.conn.execute(
+            """
+            SELECT ts_ms, symbol, side, qty, px
+              FROM fills
+             ORDER BY id DESC
+             LIMIT ?
+            """,
+            (int(limit),),
+        )
+        return [
+            {"ts_ms": r[0], "symbol": r[1], "side": r[2], "qty": r[3], "px": r[4]}
+            for r in cur.fetchall()
+        ]
+
+    def latest_runtime_metrics(self) -> Dict[str, Dict[str, Any]]:
+        cur = self.conn.execute(
+            """
+            SELECT metric_group, metric_name, metric_value, metric_text, labels_json, MAX(ts_ms)
+              FROM runtime_metrics
+             GROUP BY metric_group, metric_name
+            """
+        )
+        out: Dict[str, Dict[str, Any]] = {}
+        for group, name, value, text_value, labels_json, ts_ms in cur.fetchall():
+            labels = self._loads(labels_json) or {}
+            if value is None and text_value is not None:
+                value = text_value
+            elif value is None and "value_json" in labels:
+                try:
+                    value = json.loads(labels["value_json"])
+                except Exception:
+                    value = labels.get("value_json")
+            out.setdefault(group, {})[name] = value
+            out[group][f"{name}__ts_ms"] = ts_ms
+        return out
+
+    def query_runtime_metrics(
+        self,
+        metric_group: Optional[str] = None,
+        metric_name: Optional[str] = None,
+        since_ts_ms: Optional[int] = None,
+        until_ts_ms: Optional[int] = None,
+        limit: Optional[int] = None,
+    ):
+        where = []
+        params = []
+        if metric_group:
+            where.append("metric_group = ?")
+            params.append(metric_group)
+        if metric_name:
+            where.append("metric_name = ?")
+            params.append(metric_name)
+        if since_ts_ms:
+            where.append("ts_ms >= ?")
+            params.append(int(since_ts_ms))
+        if until_ts_ms:
+            where.append("ts_ms <= ?")
+            params.append(int(until_ts_ms))
+        sql = "SELECT ts_ms, metric_group, metric_name, metric_value, metric_text, labels_json FROM runtime_metrics"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY ts_ms ASC"
+        if limit:
+            sql += " LIMIT ?"
+            params.append(int(limit))
+        cur = self.conn.execute(sql, tuple(params))
+        return [
+            {
+                "ts_ms": r[0],
+                "metric_group": r[1],
+                "metric_name": r[2],
+                "metric_value": r[3] if r[3] is not None else r[4],
+                "metric_numeric_value": r[3],
+                "metric_text": r[4],
+                "labels": self._loads(r[5]) or {},
+            }
+            for r in cur.fetchall()
+        ]
 
     @staticmethod
     def _json(value: Any) -> Optional[str]:

@@ -49,6 +49,9 @@ def import_check() -> None:
         "tradarbot.app.main",
         "tradarbot.storage.sqlite_store",
         "tradarbot.execution.exchange_factory",
+        "tradarbot.monitoring.metrics",
+        "tradarbot.monitoring.heartbeat",
+        "tradarbot.monitoring.reporting",
     ):
         importlib.import_module(module)
 
@@ -63,7 +66,14 @@ def check_db(cfg: Dict[str, Any]) -> None:
     db_path.parent.mkdir(parents=True, exist_ok=True)
     store = SQLiteStore(str(db_path))
     store.init_schema()
+    required_tables = ["runtime_heartbeat", "runtime_metrics", "runtime_status_events"]
+    missing = [
+        t for t in required_tables
+        if store.conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone() is None
+    ]
     store.conn.close()
+    if missing:
+        raise RuntimeError(f"monitoring_tables_missing tables={','.join(missing)}")
 
 
 def check_artifacts(cfg: Dict[str, Any]) -> None:
