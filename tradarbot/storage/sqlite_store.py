@@ -268,6 +268,111 @@ class SQLiteStore:
           metadata_json TEXT
         );
         """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ml_shadow_predictions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          symbol TEXT NOT NULL,
+          mode TEXT,
+          prediction_source TEXT,
+          model_name TEXT,
+          prob REAL,
+          pred_prob REAL,
+          score REAL,
+          entry_score REAL,
+          prob_percentile_rank REAL,
+          rolling_volatility_24h REAL,
+          predicted_time_to_peak_hours REAL,
+          market_risk_off_score REAL,
+          payload_json TEXT
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ml_shadow_predictions_ts_symbol ON ml_shadow_predictions(ts_ms, symbol);")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ml_shadow_decisions (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          symbol TEXT NOT NULL,
+          mode TEXT,
+          accepted INTEGER NOT NULL DEFAULT 0,
+          reject_reason TEXT,
+          would_trade INTEGER NOT NULL DEFAULT 0,
+          would_side TEXT,
+          would_qty REAL,
+          would_limit_px REAL,
+          would_notional_usd REAL,
+          prob REAL,
+          pred_prob REAL,
+          score REAL,
+          entry_score REAL,
+          prob_percentile_rank REAL,
+          rolling_volatility_24h REAL,
+          predicted_time_to_peak_hours REAL,
+          market_risk_off_score REAL,
+          prediction_source TEXT,
+          model_name TEXT,
+          prob_size_multiplier REAL,
+          vol_size_multiplier REAL,
+          kelly_fraction REAL,
+          kelly_multiplier REAL,
+          regime_size_multiplier REAL,
+          total_size_multiplier REAL,
+          top_n_rank INTEGER,
+          payload_json TEXT
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ml_shadow_decisions_ts_symbol ON ml_shadow_decisions(ts_ms, symbol);")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ml_shadow_signals (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          symbol TEXT NOT NULL,
+          mode TEXT,
+          action TEXT,
+          side TEXT,
+          qty REAL,
+          limit_px REAL,
+          notional_usd REAL,
+          blocked_execution INTEGER NOT NULL DEFAULT 1,
+          prediction_source TEXT,
+          model_name TEXT,
+          prob REAL,
+          score REAL,
+          entry_score REAL,
+          payload_json TEXT
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ml_shadow_signals_ts_symbol ON ml_shadow_signals(ts_ms, symbol);")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ml_shadow_execution_comparisons (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          symbol TEXT,
+          comparison_type TEXT NOT NULL,
+          status TEXT NOT NULL,
+          shadow_signal_id INTEGER,
+          fill_id INTEGER,
+          lag_seconds REAL,
+          price_diff_pct REAL,
+          size_diff_pct REAL,
+          details_json TEXT
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ml_shadow_exec_cmp_ts ON ml_shadow_execution_comparisons(ts_ms, status);")
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS ml_replay_parity_checks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts_ms INTEGER NOT NULL,
+          status TEXT NOT NULL,
+          check_name TEXT,
+          symbols_json TEXT,
+          metrics_json TEXT,
+          failures_json TEXT,
+          warnings_json TEXT,
+          payload_json TEXT
+        );
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_ml_replay_parity_checks_ts ON ml_replay_parity_checks(ts_ms, status);")
         self.conn.commit()
 
     def insert_candle(self, ev: CandleEvent) -> None:
@@ -760,3 +865,132 @@ class SQLiteStore:
             "reasons": json.loads(row[3] or "[]"),
             "metadata": json.loads(row[4] or "{}"),
         }
+
+
+    # ------------------------------------------------------------------
+    # Phase 5.8 ML shadow-mode persistence and reporting
+    # ------------------------------------------------------------------
+    def _dict_rows(self, query: str, params=()):
+        cur = self.conn.execute(query, params)
+        cols = [c[0] for c in cur.description]
+        return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+    def _decode_payloads(self, rows, *json_fields):
+        out = []
+        for row in rows:
+            item = dict(row)
+            for field in json_fields:
+                if field in item:
+                    raw = item.pop(field)
+                    item[field.replace("_json", "")] = self._loads(raw) if raw else ({} if field.endswith("payload_json") or field.endswith("details_json") or field.endswith("metrics_json") else [])
+            out.append(item)
+        return out
+
+    def insert_ml_shadow_prediction(self, *, ts_ms: int, symbol: str, mode: str = "shadow", prediction_source=None, model_name=None, prob=None, pred_prob=None, score=None, entry_score=None, prob_percentile_rank=None, rolling_volatility_24h=None, predicted_time_to_peak_hours=None, market_risk_off_score=None, payload=None, **kwargs) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO ml_shadow_predictions(ts_ms, symbol, mode, prediction_source, model_name, prob, pred_prob, score, entry_score, prob_percentile_rank, rolling_volatility_24h, predicted_time_to_peak_hours, market_risk_off_score, payload_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (int(ts_ms), symbol, mode, prediction_source, model_name, prob, pred_prob, score, entry_score, prob_percentile_rank, rolling_volatility_24h, predicted_time_to_peak_hours, market_risk_off_score, self._json(payload or kwargs)),
+        )
+        self.conn.commit()
+
+    def insert_ml_shadow_decision(self, *, ts_ms: int, symbol: str, mode: str = "shadow", accepted: bool = False, reject_reason=None, would_trade: bool = False, would_side=None, would_qty=None, would_limit_px=None, would_notional_usd=None, prob=None, pred_prob=None, score=None, entry_score=None, prob_percentile_rank=None, rolling_volatility_24h=None, predicted_time_to_peak_hours=None, market_risk_off_score=None, prediction_source=None, model_name=None, prob_size_multiplier=None, vol_size_multiplier=None, kelly_fraction=None, kelly_multiplier=None, regime_size_multiplier=None, total_size_multiplier=None, top_n_rank=None, payload=None, **kwargs) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO ml_shadow_decisions(ts_ms, symbol, mode, accepted, reject_reason, would_trade, would_side, would_qty, would_limit_px, would_notional_usd, prob, pred_prob, score, entry_score, prob_percentile_rank, rolling_volatility_24h, predicted_time_to_peak_hours, market_risk_off_score, prediction_source, model_name, prob_size_multiplier, vol_size_multiplier, kelly_fraction, kelly_multiplier, regime_size_multiplier, total_size_multiplier, top_n_rank, payload_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (int(ts_ms), symbol, mode, self._bool_int(accepted), reject_reason, self._bool_int(would_trade), would_side, would_qty, would_limit_px, would_notional_usd, prob, pred_prob, score, entry_score, prob_percentile_rank, rolling_volatility_24h, predicted_time_to_peak_hours, market_risk_off_score, prediction_source, model_name, prob_size_multiplier, vol_size_multiplier, kelly_fraction, kelly_multiplier, regime_size_multiplier, total_size_multiplier, top_n_rank, self._json(payload or kwargs)),
+        )
+        self.conn.commit()
+
+    def insert_ml_shadow_signal(self, *, ts_ms: int, symbol: str, mode: str = "shadow", action: str = "would_buy", side: str = "BUY", qty=None, limit_px=None, notional_usd=None, blocked_execution: bool = True, prediction_source=None, model_name=None, prob=None, score=None, entry_score=None, payload=None, **kwargs) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO ml_shadow_signals(ts_ms, symbol, mode, action, side, qty, limit_px, notional_usd, blocked_execution, prediction_source, model_name, prob, score, entry_score, payload_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (int(ts_ms), symbol, mode, action, side, qty, limit_px, notional_usd, self._bool_int(blocked_execution), prediction_source, model_name, prob, score, entry_score, self._json(payload or kwargs)),
+        )
+        self.conn.commit()
+
+    def insert_ml_shadow_execution_comparison(self, *, ts_ms: int, symbol: str = None, comparison_type: str, status: str, shadow_signal_id=None, fill_id=None, lag_seconds=None, price_diff_pct=None, size_diff_pct=None, details=None, **kwargs) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO ml_shadow_execution_comparisons(ts_ms, symbol, comparison_type, status, shadow_signal_id, fill_id, lag_seconds, price_diff_pct, size_diff_pct, details_json)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            (int(ts_ms), symbol, comparison_type, status, shadow_signal_id, fill_id, lag_seconds, price_diff_pct, size_diff_pct, self._json(details or kwargs)),
+        )
+        self.conn.commit()
+
+    def insert_ml_replay_parity_check(self, *, ts_ms: int, status: str, check_name: str = "recent_window", symbols=None, metrics=None, failures=None, warnings=None, payload=None, **kwargs) -> None:
+        self.conn.execute(
+            """
+            INSERT INTO ml_replay_parity_checks(ts_ms, status, check_name, symbols_json, metrics_json, failures_json, warnings_json, payload_json)
+            VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (int(ts_ms), status, check_name, self._json(list(symbols or [])), self._json(metrics or {}), self._json(list(failures or [])), self._json(list(warnings or [])), self._json(payload or kwargs)),
+        )
+        self.conn.commit()
+
+    def recent_ml_shadow_predictions(self, limit: int = 100, since_ts_ms: Optional[int] = None):
+        where = "WHERE ts_ms >= ?" if since_ts_ms is not None else ""
+        params = (int(since_ts_ms), int(limit)) if since_ts_ms is not None else (int(limit),)
+        rows = self._dict_rows(f"SELECT * FROM ml_shadow_predictions {where} ORDER BY ts_ms DESC, id DESC LIMIT ?", params)
+        return self._decode_payloads(rows, "payload_json")
+
+    def recent_ml_shadow_signals(self, limit: int = 100, since_ts_ms: Optional[int] = None):
+        where = "WHERE ts_ms >= ?" if since_ts_ms is not None else ""
+        params = (int(since_ts_ms), int(limit)) if since_ts_ms is not None else (int(limit),)
+        rows = self._dict_rows(f"SELECT * FROM ml_shadow_signals {where} ORDER BY ts_ms DESC, id DESC LIMIT ?", params)
+        return self._decode_payloads(rows, "payload_json")
+
+    def recent_ml_shadow_decisions(self, limit: int = 100, since_ts_ms: Optional[int] = None):
+        where = "WHERE ts_ms >= ?" if since_ts_ms is not None else ""
+        params = (int(since_ts_ms), int(limit)) if since_ts_ms is not None else (int(limit),)
+        rows = self._dict_rows(f"SELECT * FROM ml_shadow_decisions {where} ORDER BY ts_ms DESC, id DESC LIMIT ?", params)
+        return self._decode_payloads(rows, "payload_json")
+
+    def shadow_summary(self, since_ts_ms: Optional[int] = None) -> Dict[str, Any]:
+        pred_where = "WHERE ts_ms >= ?" if since_ts_ms is not None else ""
+        params = (int(since_ts_ms),) if since_ts_ms is not None else ()
+        pred_count = self.conn.execute(f"SELECT COUNT(*) FROM ml_shadow_predictions {pred_where}", params).fetchone()[0]
+        sig_count = self.conn.execute(f"SELECT COUNT(*) FROM ml_shadow_signals {pred_where}", params).fetchone()[0]
+        dec_count = self.conn.execute(f"SELECT COUNT(*) FROM ml_shadow_decisions {pred_where}", params).fetchone()[0]
+        would_count = self.conn.execute(f"SELECT COUNT(*) FROM ml_shadow_decisions {pred_where} {'AND' if pred_where else 'WHERE'} would_trade=1", params).fetchone()[0]
+        accepted_count = self.conn.execute(f"SELECT COUNT(*) FROM ml_shadow_decisions {pred_where} {'AND' if pred_where else 'WHERE'} accepted=1", params).fetchone()[0]
+        rejected_count = max(0, int(dec_count or 0) - int(accepted_count or 0))
+        rows = self.conn.execute(f"SELECT DISTINCT symbol FROM ml_shadow_predictions {pred_where} ORDER BY symbol", params).fetchall()
+        return {
+            "since_ts_ms": since_ts_ms,
+            "prediction_count": int(pred_count or 0),
+            "signal_count": int(sig_count or 0),
+            "decision_count": int(dec_count or 0),
+            "would_trade_count": int(would_count or 0),
+            "accepted_count": int(accepted_count or 0),
+            "rejected_count": int(rejected_count or 0),
+            "symbols": [r[0] for r in rows],
+        }
+
+    def recent_execution_fills(self, limit: int = 100, since_ts_ms: Optional[int] = None):
+        where = "WHERE ts_ms >= ?" if since_ts_ms is not None else ""
+        params = (int(since_ts_ms), int(limit)) if since_ts_ms is not None else (int(limit),)
+        try:
+            rows = self._dict_rows(f"SELECT id, ts_ms, symbol, side, qty, px, 'paper' AS broker_mode FROM fills {where} ORDER BY ts_ms DESC, id DESC LIMIT ?", params)
+        except Exception:
+            rows = []
+        try:
+            of = self._dict_rows(f"SELECT id, ts_ms, symbol, side, qty, px, metadata_json FROM order_fills {where} ORDER BY ts_ms DESC, id DESC LIMIT ?", params)
+            for row in of:
+                row["broker_mode"] = "unknown"
+                if row.get("metadata_json"):
+                    meta = self._loads(row.get("metadata_json")) or {}
+                    row["broker_mode"] = meta.get("broker_mode", meta.get("mode", "unknown"))
+                row.pop("metadata_json", None)
+            rows.extend(of)
+        except Exception:
+            pass
+        return sorted(rows, key=lambda r: int(r.get("ts_ms") or 0), reverse=True)[: int(limit)]

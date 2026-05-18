@@ -11,6 +11,14 @@ from tradarbot.core.events import OrderIntent
 from tradarbot.execution.order_router import OrderRouter
 from tradarbot.ml.live_features import build_live_feature_frame
 from tradarbot.ml.live_predictor import LivePredictor
+from tradarbot.ml.shadow_eval import (
+    ShadowDecisionRecord,
+    ShadowPredictionRecord,
+    ShadowSignalRecord,
+    record_shadow_decision,
+    record_shadow_prediction,
+    record_shadow_signal,
+)
 from scripts.replay_ml_strategy import (
     build_runtime_args,
     compute_size_multipliers,
@@ -33,6 +41,18 @@ class MLStrategy:
 
     def __init__(self, cfg: Dict):
         self.cfg = dict(cfg or {})
+        raw_mode = str(self.cfg.get("mode") or "").strip().lower()
+        # Backward compatibility: older config used ml_live.mode as predictor mode
+        # (heuristic/db_latest/artifacts). Treat those as paper execution modes and
+        # leave predictor_mode to LivePredictor.
+        if raw_mode in {"off", "shadow", "paper", "live"}:
+            self.ml_mode = raw_mode
+        elif self.cfg.get("enabled", True) is False:
+            self.ml_mode = "off"
+        else:
+            self.ml_mode = "paper"
+            if raw_mode and "predictor_mode" not in self.cfg:
+                self.cfg["predictor_mode"] = raw_mode
         self.predictor = LivePredictor(self.cfg)
         self.router = None
 
@@ -62,7 +82,8 @@ class MLStrategy:
         self.runtime_args = self._build_runtime_args()
 
         log.info(
-            "MLStrategy predictor initialized mode=%s min_ready_bars=%s lookback_bars=%s centralized_feature_state=%s",
+            "MLStrategy initialized ml_mode=%s predictor_mode=%s min_ready_bars=%s lookback_bars=%s centralized_feature_state=%s",
+            self.ml_mode,
             getattr(self.predictor, "mode", self.cfg.get("predictor_mode", self.cfg.get("mode"))),
             self.min_ready_bars,
             self.lookback_bars,
@@ -73,6 +94,10 @@ class MLStrategy:
         return []
 
     def on_candle(self, e, ctx):
+        if self.ml_mode == "off":
+            log.debug("ML_MODE_OFF symbol=%s ts_ms=%s", getattr(e, "symbol", None), getattr(e, "ts_ms", None))
+            return []
+
         self._record_candle(e)
         self._sync_state_symbol(e.symbol, ctx)
 
@@ -168,6 +193,8 @@ class MLStrategy:
                     payload.get("model_name"),
                 )
 
+        self._persist_shadow_predictions(ctx, prediction_map, int(e.ts_ms))
+
         candidate_df = self._merge_predictions(feature_df, prediction_map)
         log.info(
             "ML_DEBUG candidate_df rows=%s cols=%s",
@@ -191,6 +218,7 @@ class MLStrategy:
         )
 
         self._update_state_with_rankings(ctx, ranked, int(e.ts_ms))
+        self._persist_shadow_candidate_decisions(ctx, candidate_df, ranked, int(e.ts_ms))
 
         if ranked.empty:
             self.last_eval_ts_by_symbol[e.symbol] = int(e.ts_ms)
@@ -203,9 +231,166 @@ class MLStrategy:
             return []
 
         intents = self._build_entry_intents(ranked, args, ctx, ts_ms=int(e.ts_ms))
+        if self.ml_mode == "shadow":
+            self._persist_shadow_signals(ctx, ranked, intents, int(e.ts_ms))
+            self._increment_state_counter(ctx, "ml_shadow_blocked_execution_count", len(intents))
+            for intent in intents:
+                log.info(
+                    "ML_SHADOW_BLOCKED_EXECUTION symbol=%s side=%s qty=%.8f limit_px=%.8f",
+                    intent.symbol,
+                    intent.side,
+                    float(intent.qty),
+                    float(intent.limit_px),
+                )
+            self.last_eval_ts_by_symbol[e.symbol] = int(e.ts_ms)
+            log.debug("ML_DEBUG shadow_intents_blocked=%s", len(intents))
+            return []
+
         self.last_eval_ts_by_symbol[e.symbol] = int(e.ts_ms)
         log.debug("ML_DEBUG intents_count=%s", len(intents))
         return intents
+
+
+    def _increment_state_counter(self, ctx, name: str, amount: int = 1) -> None:
+        state = getattr(ctx, "state", None)
+        if state is None:
+            return
+        try:
+            setattr(state, name, int(getattr(state, name, 0) or 0) + int(amount))
+        except Exception:
+            pass
+
+    def _persist_shadow_predictions(self, ctx, prediction_map: Dict[str, Dict], ts_ms: int) -> None:
+        if self.ml_mode not in {"shadow", "paper", "live"} or not prediction_map:
+            return
+        store = getattr(ctx, "store", None)
+        for symbol, payload in prediction_map.items():
+            try:
+                record = ShadowPredictionRecord.from_payload(ts_ms=ts_ms, symbol=symbol, payload=dict(payload or {}), mode=self.ml_mode)
+                record_shadow_prediction(store, record)
+                self._increment_state_counter(ctx, "ml_shadow_prediction_count", 1)
+                log.info(
+                    "ML_SHADOW_PREDICTION mode=%s symbol=%s prob=%s score=%s source=%s model=%s",
+                    self.ml_mode,
+                    symbol,
+                    payload.get("prob", payload.get("pred_prob")),
+                    payload.get("score", payload.get("entry_score")),
+                    payload.get("prediction_source"),
+                    payload.get("model_name"),
+                )
+            except Exception:
+                log.exception("ML_SHADOW_PREDICTION_PERSIST_FAILED symbol=%s", symbol)
+
+    def _persist_shadow_candidate_decisions(self, ctx, candidate_df: pd.DataFrame, ranked: pd.DataFrame, ts_ms: int) -> None:
+        if self.ml_mode not in {"shadow", "paper", "live"} or candidate_df is None or candidate_df.empty:
+            return
+        store = getattr(ctx, "store", None)
+        ranked_symbols = [] if ranked is None or ranked.empty or "symbol" not in ranked.columns else ranked["symbol"].astype(str).tolist()
+        rank_map = {symbol: idx + 1 for idx, symbol in enumerate(ranked_symbols)}
+        for _, row in candidate_df.iterrows():
+            symbol = str(row.get("symbol"))
+            accepted = symbol in rank_map
+            reject_reason = None if accepted else "filtered_by_replay_compatible_path"
+            record = ShadowDecisionRecord(
+                ts_ms=ts_ms,
+                symbol=symbol,
+                mode=self.ml_mode,
+                accepted=accepted,
+                reject_reason=reject_reason,
+                would_trade=False,
+                prob=row.get("prob"),
+                pred_prob=row.get("pred_prob", row.get("prob")),
+                score=row.get("score"),
+                entry_score=row.get("entry_score"),
+                prob_percentile_rank=row.get("prob_percentile_rank"),
+                rolling_volatility_24h=row.get("rolling_volatility_24h"),
+                predicted_time_to_peak_hours=row.get("predicted_time_to_peak_hours"),
+                market_risk_off_score=row.get("market_risk_off_score"),
+                prediction_source=row.get("prediction_source"),
+                model_name=row.get("model_name"),
+                regime_size_multiplier=row.get("_regime_size_multiplier"),
+                top_n_rank=rank_map.get(symbol),
+                payload=row.to_dict(),
+            )
+            record_shadow_decision(store, record)
+            self._increment_state_counter(ctx, "ml_shadow_candidate_count", 1)
+            log.info(
+                "ML_SHADOW_CANDIDATE mode=%s symbol=%s accepted=%s reject_reason=%s prob=%s score=%s rank=%s",
+                self.ml_mode,
+                symbol,
+                accepted,
+                reject_reason,
+                row.get("pred_prob", row.get("prob")),
+                row.get("entry_score", row.get("score")),
+                rank_map.get(symbol),
+            )
+
+    def _persist_shadow_signals(self, ctx, ranked: pd.DataFrame, intents: List[OrderIntent], ts_ms: int) -> None:
+        if self.ml_mode != "shadow" or ranked is None or ranked.empty:
+            return
+        store = getattr(ctx, "store", None)
+        row_by_symbol = {str(row.get("symbol")): row for _, row in ranked.iterrows()}
+        for intent in intents:
+            row = row_by_symbol.get(str(intent.symbol), {})
+            notional = float(intent.qty) * float(intent.limit_px)
+            record_shadow_signal(
+                store,
+                ShadowSignalRecord(
+                    ts_ms=ts_ms,
+                    symbol=str(intent.symbol),
+                    mode=self.ml_mode,
+                    action="would_buy",
+                    side=str(intent.side),
+                    qty=float(intent.qty),
+                    limit_px=float(intent.limit_px),
+                    notional_usd=notional,
+                    blocked_execution=True,
+                    prediction_source=row.get("prediction_source") if hasattr(row, "get") else None,
+                    model_name=row.get("model_name") if hasattr(row, "get") else None,
+                    prob=row.get("pred_prob", row.get("prob")) if hasattr(row, "get") else None,
+                    score=row.get("score") if hasattr(row, "get") else None,
+                    entry_score=row.get("entry_score") if hasattr(row, "get") else None,
+                    payload=row.to_dict() if hasattr(row, "to_dict") else {},
+                ),
+            )
+            record_shadow_decision(
+                store,
+                ShadowDecisionRecord(
+                    ts_ms=ts_ms,
+                    symbol=str(intent.symbol),
+                    mode=self.ml_mode,
+                    accepted=True,
+                    reject_reason=None,
+                    would_trade=True,
+                    would_side=str(intent.side),
+                    would_qty=float(intent.qty),
+                    would_limit_px=float(intent.limit_px),
+                    would_notional_usd=notional,
+                    prob=row.get("prob") if hasattr(row, "get") else None,
+                    pred_prob=row.get("pred_prob", row.get("prob")) if hasattr(row, "get") else None,
+                    score=row.get("score") if hasattr(row, "get") else None,
+                    entry_score=row.get("entry_score") if hasattr(row, "get") else None,
+                    prob_percentile_rank=row.get("prob_percentile_rank") if hasattr(row, "get") else None,
+                    rolling_volatility_24h=row.get("rolling_volatility_24h") if hasattr(row, "get") else None,
+                    predicted_time_to_peak_hours=row.get("predicted_time_to_peak_hours") if hasattr(row, "get") else None,
+                    market_risk_off_score=row.get("market_risk_off_score") if hasattr(row, "get") else None,
+                    prediction_source=row.get("prediction_source") if hasattr(row, "get") else None,
+                    model_name=row.get("model_name") if hasattr(row, "get") else None,
+                    regime_size_multiplier=row.get("_regime_size_multiplier") if hasattr(row, "get") else None,
+                    total_size_multiplier=row.get("total_size_multiplier") if hasattr(row, "get") else None,
+                    payload=row.to_dict() if hasattr(row, "to_dict") else {},
+                ),
+            )
+            self._increment_state_counter(ctx, "ml_shadow_signal_count", 1)
+            self._increment_state_counter(ctx, "ml_shadow_would_trade_count", 1)
+            log.info(
+                "ML_SHADOW_SIGNAL symbol=%s side=%s qty=%.8f limit_px=%.8f notional=%.2f",
+                intent.symbol,
+                intent.side,
+                float(intent.qty),
+                float(intent.limit_px),
+                notional,
+            )
 
     def _record_candle(self, e):
         arr = self.price_history[e.symbol]
@@ -496,7 +681,8 @@ class MLStrategy:
             )
 
             log.info(
-                "ML SIGNAL BUY %s prob=%.4f score=%.4f size_mult=%.4f target_notional=%.2f routed_notional=%.2f qty=%.8f limit_px=%.8f",
+                "%s %s prob=%.4f score=%.4f size_mult=%.4f target_notional=%.2f routed_notional=%.2f qty=%.8f limit_px=%.8f",
+                "ML_SHADOW_WOULD_BUY" if self.ml_mode == "shadow" else "ML SIGNAL BUY",
                 symbol,
                 float(row.get("pred_prob", row.get("prob", 0.0))),
                 float(row.get("entry_score", row.get("score", 0.0))),

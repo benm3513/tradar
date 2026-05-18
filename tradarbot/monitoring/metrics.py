@@ -170,6 +170,13 @@ class MetricsCollector:
             "last_refresh_ts_ms": getattr(state, "ml_last_refresh_ts_ms", None),
             "last_ranking_ts_ms": getattr(state, "ml_last_ranking_ts_ms", None),
             "top_symbols": list(getattr(state, "ml_current_top_n_symbols", []) or [])[:20],
+            "shadow_prediction_count": _safe_int(getattr(state, "ml_shadow_prediction_count", 0)),
+            "shadow_candidate_count": _safe_int(getattr(state, "ml_shadow_candidate_count", 0)),
+            "shadow_signal_count": _safe_int(getattr(state, "ml_shadow_signal_count", 0)),
+            "shadow_would_trade_count": _safe_int(getattr(state, "ml_shadow_would_trade_count", 0)),
+            "shadow_blocked_execution_count": _safe_int(getattr(state, "ml_shadow_blocked_execution_count", 0)),
+            "parity_check_count": _safe_int(getattr(state, "ml_parity_check_count", 0)),
+            "parity_failure_count": _safe_int(getattr(state, "ml_parity_failure_count", 0)),
         }
 
     def _execution_metrics(self, ctx: Any, broker: Any) -> Dict[str, Any]:

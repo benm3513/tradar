@@ -121,6 +121,15 @@ class State:
         self.prediction_error_counts: int = 0
         self.fallback_prediction_counts: int = 0
 
+        # Phase 5.8 shadow-mode / parity counters.
+        self.ml_shadow_prediction_count: int = 0
+        self.ml_shadow_candidate_count: int = 0
+        self.ml_shadow_signal_count: int = 0
+        self.ml_shadow_would_trade_count: int = 0
+        self.ml_shadow_blocked_execution_count: int = 0
+        self.ml_parity_check_count: int = 0
+        self.ml_parity_failure_count: int = 0
+
         self.last_market_data_ts_ms: Optional[int] = None
         self.last_book_ts_ms: Optional[int] = None
         self.last_candle_ts_ms: Optional[int] = None
