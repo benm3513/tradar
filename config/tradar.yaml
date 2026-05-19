@@ -264,6 +264,26 @@ ml_live:
   min_ready_bars: 168
   use_centralized_feature_state: true
   evaluation_interval_s: 1
+
+  # Phase 5.8.5 inference throttling. This gates expensive feature/predict/rank/persist
+  # work before it happens, instead of only suppressing final signal emission.
+  throttle_inference: true
+  inference_interval_s: 60
+  inference_on_candle_close_only: false
+
+  # Phase 5.8.5 signal stabilization / paper-readiness controls.
+  suppress_duplicate_signals: true
+  min_signal_interval_seconds: 900
+  min_prob_delta: 0.02
+  min_score_delta: 0.15
+  max_shadow_signals_per_hour: 20
+  signal_on_candle_close_only: true
+
+  probability_clip_min: 0.0
+  probability_clip_max: 0.95
+  confidence_dampening_factor: 0.75
+  percentile_smoothing_window: 100
+
   order_notional_buffer: 0.98
   predictor_mode: heuristic
   regime_scale_threshold: 0.7

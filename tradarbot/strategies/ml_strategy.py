@@ -11,6 +11,8 @@ from tradarbot.core.events import OrderIntent
 from tradarbot.execution.order_router import OrderRouter
 from tradarbot.ml.live_features import build_live_feature_frame
 from tradarbot.ml.live_predictor import LivePredictor
+from tradarbot.ml.calibration import ProbabilityCalibrator
+from tradarbot.ml.signal_throttle import SignalThrottle
 from tradarbot.ml.shadow_eval import (
     ShadowDecisionRecord,
     ShadowPredictionRecord,
@@ -54,16 +56,29 @@ class MLStrategy:
             if raw_mode and "predictor_mode" not in self.cfg:
                 self.cfg["predictor_mode"] = raw_mode
         self.predictor = LivePredictor(self.cfg)
+        self.calibrator = ProbabilityCalibrator(self.cfg)
+        self.signal_throttle = SignalThrottle(self.cfg)
         self.router = None
 
         self.last_signal_ts: Dict[str, int] = {}
         self.last_eval_ts_by_symbol: Dict[str, int] = {}
+        self.last_inference_bucket_ts: int | None = None
+        self.last_inference_ts_ms: int | None = None
         self.price_history = defaultdict(list)
 
         self.lookback_bars = int(
             self.cfg.get("feature_lookback_bars", self.cfg.get("warmup_candles", 200))
         )
         self.evaluation_interval_s = int(self.cfg.get("evaluation_interval_s", 1))
+        self.throttle_inference = bool(self.cfg.get("throttle_inference", True))
+        self.inference_interval_s = int(
+            self.cfg.get(
+                "inference_interval_s",
+                self.cfg.get("min_inference_interval_seconds", max(60, self.evaluation_interval_s)),
+            )
+        )
+        self.inference_interval_s = max(1, self.inference_interval_s)
+        self.inference_on_candle_close_only = bool(self.cfg.get("inference_on_candle_close_only", False))
         self.candle_interval_s = int(
             self.cfg.get("candle_interval_s", self.cfg.get("feature_interval_s", 3600))
         )
@@ -82,12 +97,14 @@ class MLStrategy:
         self.runtime_args = self._build_runtime_args()
 
         log.info(
-            "MLStrategy initialized ml_mode=%s predictor_mode=%s min_ready_bars=%s lookback_bars=%s centralized_feature_state=%s",
+            "MLStrategy initialized ml_mode=%s predictor_mode=%s min_ready_bars=%s lookback_bars=%s centralized_feature_state=%s inference_interval_s=%s throttle_inference=%s",
             self.ml_mode,
             getattr(self.predictor, "mode", self.cfg.get("predictor_mode", self.cfg.get("mode"))),
             self.min_ready_bars,
             self.lookback_bars,
             self.use_centralized_feature_state,
+            self.inference_interval_s,
+            self.throttle_inference,
         )
 
     def on_listing(self, ev, ctx):
@@ -164,6 +181,9 @@ class MLStrategy:
             )
             return []
 
+        if not self._should_run_inference(e, ctx, ready_symbols):
+            return []
+
         feature_df = self._build_feature_frame(ready_symbols, ctx)
         log.info(
             "ML_DEBUG feature_df rows=%s cols=%s",
@@ -176,6 +196,7 @@ class MLStrategy:
             return []
 
         prediction_map = self.predictor.predict(feature_df, ctx=ctx)
+        prediction_map = self._calibrate_predictions(prediction_map)
         log.info(
             "ML_DEBUG prediction_map symbols=%s",
             list(prediction_map.keys()) if prediction_map else [],
@@ -250,6 +271,84 @@ class MLStrategy:
         log.debug("ML_DEBUG intents_count=%s", len(intents))
         return intents
 
+
+    def _should_run_inference(self, e, ctx, ready_symbols: List[str]) -> bool:
+        """Gate expensive live ML inference before feature/predict/rank/persist work.
+
+        Phase 5.8.5 initially suppressed duplicate signals after prediction. This
+        method moves the gate earlier so shadow mode does not burn CPU, logs, and
+        SQLite writes on every symbol/tick update. The default is one inference
+        pass per inference_interval_s bucket, shared across symbols.
+        """
+        if not self.throttle_inference:
+            return True
+
+        ts_ms = int(getattr(e, "ts_ms", 0) or 0)
+        interval_ms = max(1, int(self.inference_interval_s)) * 1000
+
+        if self.inference_on_candle_close_only:
+            candle_ms = max(1, int(self.candle_interval_s or self.inference_interval_s)) * 1000
+            if candle_ms > 0 and ts_ms % candle_ms != 0:
+                log.info(
+                    "ML_INFERENCE_SKIPPED_CANDLE_CLOSE_ONLY symbol=%s ts_ms=%s candle_interval_s=%s ready_symbols=%s",
+                    getattr(e, "symbol", None),
+                    ts_ms,
+                    self.candle_interval_s,
+                    ready_symbols,
+                )
+                self._increment_state_counter(ctx, "ml_inference_skipped_count", 1)
+                return False
+
+        bucket_ts = (ts_ms // interval_ms) * interval_ms
+        if self.last_inference_bucket_ts == bucket_ts:
+            log.info(
+                "ML_INFERENCE_SKIPPED_INTERVAL symbol=%s ts_ms=%s bucket_ts=%s inference_interval_s=%s ready_symbols=%s",
+                getattr(e, "symbol", None),
+                ts_ms,
+                bucket_ts,
+                self.inference_interval_s,
+                ready_symbols,
+            )
+            self._increment_state_counter(ctx, "ml_inference_skipped_count", 1)
+            return False
+
+        if self.last_inference_ts_ms is not None and ts_ms - int(self.last_inference_ts_ms) < interval_ms:
+            gap_ms = ts_ms - int(self.last_inference_ts_ms)
+            log.info(
+                "ML_INFERENCE_SKIPPED_MIN_GAP symbol=%s ts_ms=%s gap_ms=%s min_gap_ms=%s ready_symbols=%s",
+                getattr(e, "symbol", None),
+                ts_ms,
+                gap_ms,
+                interval_ms,
+                ready_symbols,
+            )
+            self._increment_state_counter(ctx, "ml_inference_skipped_count", 1)
+            return False
+
+        self.last_inference_bucket_ts = bucket_ts
+        self.last_inference_ts_ms = ts_ms
+        log.info(
+            "ML_INFERENCE_ALLOWED symbol=%s ts_ms=%s bucket_ts=%s inference_interval_s=%s ready_symbols=%s",
+            getattr(e, "symbol", None),
+            ts_ms,
+            bucket_ts,
+            self.inference_interval_s,
+            ready_symbols,
+        )
+        return True
+
+
+    def _calibrate_predictions(self, prediction_map: Dict[str, Dict]) -> Dict[str, Dict]:
+        if not prediction_map:
+            return {}
+        out: Dict[str, Dict] = {}
+        for symbol, payload in prediction_map.items():
+            try:
+                out[str(symbol)] = self.calibrator.calibrate_payload(str(symbol), dict(payload or {}))
+            except Exception:
+                log.exception("ML_PROBABILITY_CALIBRATION_FAILED symbol=%s", symbol)
+                out[str(symbol)] = dict(payload or {})
+        return out
 
     def _increment_state_counter(self, ctx, name: str, amount: int = 1) -> None:
         state = getattr(ctx, "state", None)
@@ -670,6 +769,43 @@ class MLStrategy:
             if routed_notional < min_notional:
                 continue
 
+            prob_value = float(row.get("pred_prob", row.get("prob", 0.0)) or 0.0)
+            score_value = float(row.get("entry_score", row.get("score", prob_value)) or prob_value)
+            throttle_decision = self.signal_throttle.should_emit_signal(
+                symbol=symbol,
+                side="BUY",
+                ts_ms=ts_ms,
+                prob=prob_value,
+                score=score_value,
+                mode=self.ml_mode,
+            )
+            if not throttle_decision.allowed:
+                log.info(
+                    "ML_SIGNAL_SUPPRESSED_%s symbol=%s side=BUY prob=%.6f score=%.6f details=%s",
+                    str(throttle_decision.reason).upper(),
+                    symbol,
+                    prob_value,
+                    score_value,
+                    throttle_decision.details,
+                )
+                self._increment_state_counter(ctx, "ml_signal_suppressed_count", 1)
+                continue
+
+            self.signal_throttle.update_signal_state(
+                symbol=symbol,
+                side="BUY",
+                ts_ms=ts_ms,
+                prob=prob_value,
+                score=score_value,
+            )
+            log.info(
+                "ML_SIGNAL_ALLOWED symbol=%s side=BUY prob=%.6f score=%.6f reason=%s",
+                symbol,
+                prob_value,
+                score_value,
+                throttle_decision.reason,
+            )
+
             self.last_signal_ts[symbol] = ts_ms
             self._update_state_for_signal(
                 ctx=ctx,
@@ -684,8 +820,8 @@ class MLStrategy:
                 "%s %s prob=%.4f score=%.4f size_mult=%.4f target_notional=%.2f routed_notional=%.2f qty=%.8f limit_px=%.8f",
                 "ML_SHADOW_WOULD_BUY" if self.ml_mode == "shadow" else "ML SIGNAL BUY",
                 symbol,
-                float(row.get("pred_prob", row.get("prob", 0.0))),
-                float(row.get("entry_score", row.get("score", 0.0))),
+                prob_value,
+                score_value,
                 float(total_mult),
                 float(target_notional),
                 float(routed_notional),
