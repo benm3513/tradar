@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from tradarbot.core.events import OrderIntent
 from tradarbot.execution.binance_client import BinanceAPIError
@@ -76,6 +76,82 @@ class LiveBroker:
         self.close_all_tif = str(self.exec_cfg.get("close_all_tif", "IOC") or "IOC")
         self.close_all_price_mode = str(self.exec_cfg.get("close_all_price_mode", "aggressive_limit") or "aggressive_limit").lower()
         self.close_all_slippage_pct = float(self.exec_cfg.get("close_all_slippage_pct", 0.01) or 0.01)
+
+    def validate_startup(self) -> Dict[str, Any]:
+        """Phase 5.9 live provider/account sanity check.
+
+        Called by app/main.py only for true live startup. This intentionally
+        raises on ambiguity so live mode fails closed before any strategy can
+        submit an order.
+        """
+        profile = str((self.cfg.get("runtime", {}) or {}).get("profile", "paper") or "paper").lower()
+        broker = str(self.exec_cfg.get("broker", "paper") or "paper").lower().replace("-", "_")
+        mode = str(self.exec_cfg.get("mode", "paper") or "paper").lower().replace("-", "_")
+        provider = str(self.provider or self.exec_cfg.get("provider", "") or "").lower()
+
+        if profile != "live":
+            return {"ok": True, "skipped": "not_live_profile"}
+        if broker != "live" or mode != "live":
+            raise RuntimeError(f"LIVE_PROVIDER_CHECK_FAILED reason=execution_not_live broker={broker} mode={mode}")
+
+        required_env = [
+            str(self.exec_cfg.get("api_key_env", "ALPACA_API_KEY") or "ALPACA_API_KEY"),
+            str(self.exec_cfg.get("api_secret_env", "ALPACA_API_SECRET") or "ALPACA_API_SECRET"),
+        ]
+        missing = [name for name in required_env if not __import__("os").environ.get(name)]
+        if missing:
+            raise RuntimeError("LIVE_PROVIDER_CHECK_FAILED reason=missing_env vars=" + ",".join(missing))
+
+        if bool(self.exec_cfg.get("startup_ping_required", True)):
+            try:
+                ping = self.client.ping() if hasattr(self.client, "ping") else {"ok": True, "provider": provider}
+                log.warning("LIVE_PROVIDER_CHECK_OK provider=%s ping=%s", provider, ping)
+            except Exception as exc:
+                log.exception("LIVE_PROVIDER_CHECK_FAILED provider=%s", provider)
+                raise RuntimeError(f"LIVE_PROVIDER_CHECK_FAILED reason=ping_failed error={exc}") from exc
+
+        account = None
+        if hasattr(self.client, "get_account"):
+            try:
+                account = self.client.get_account()
+            except Exception as exc:
+                log.exception("LIVE_ACCOUNT_VALIDATION_FAILED provider=%s", provider)
+                raise RuntimeError(f"LIVE_ACCOUNT_VALIDATION_FAILED reason=get_account_failed error={exc}") from exc
+
+        status = str((account or {}).get("status", "") or "").upper()
+        required_statuses = [str(s).upper() for s in self.exec_cfg.get("account_status_required", ["ACTIVE"]) or []]
+        if required_statuses and status and status not in required_statuses:
+            raise RuntimeError(f"LIVE_ACCOUNT_VALIDATION_FAILED reason=bad_account_status status={status}")
+
+        min_cash = float(self.exec_cfg.get("min_cash_usd", 0.0) or 0.0)
+        cash = self._extract_account_cash(account)
+        if min_cash > 0 and cash is not None and cash < min_cash:
+            raise RuntimeError(f"LIVE_ACCOUNT_VALIDATION_FAILED reason=insufficient_cash cash={cash:.2f} min_cash={min_cash:.2f}")
+
+        log.warning("LIVE_ACCOUNT_VALIDATED provider=%s status=%s cash=%s", provider, status or "unknown", cash)
+        return {"ok": True, "provider": provider, "status": status, "cash": cash}
+
+    @staticmethod
+    def _extract_account_cash(account: Any) -> Optional[float]:
+        if not isinstance(account, dict):
+            return None
+        for key in ("cash", "buying_power", "portfolio_value"):
+            if account.get(key) is not None:
+                try:
+                    return float(account.get(key))
+                except Exception:
+                    pass
+        balances = account.get("balances")
+        if isinstance(balances, list):
+            for row in balances:
+                if str(row.get("asset", "")).upper() in {"USD", "USDT", "USDC"}:
+                    for key in ("free", "cash", "available"):
+                        if row.get(key) is not None:
+                            try:
+                                return float(row.get(key))
+                            except Exception:
+                                pass
+        return None
 
     def positions_snapshot(self):
         return {k: v.to_dict() for k, v in self.canonical_positions().items()}

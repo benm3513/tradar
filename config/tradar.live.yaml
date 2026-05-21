@@ -1,4 +1,4 @@
-env: paper
+env: live
 exchange: binance_spot_testnet
 data_source: rest_poll
 min_move_bps: 2
@@ -31,7 +31,7 @@ ws:
   - 10
   - 30
 runtime:
-  profile: ${TRADAR_PROFILE:-paper}
+  profile: ${TRADAR_PROFILE:-live}
   candle_interval_s: 1
   log_level: ${TRADAR_LOG_LEVEL:-INFO}
   data_dir: ${TRADAR_DATA_DIR:-.}
@@ -40,28 +40,30 @@ runtime:
 deployment:
   enabled: true
   service_name: tradar
-  environment: ${TRADAR_ENV:-local}
+  environment: ${TRADAR_ENV:-vps_live}
   healthcheck:
     enabled: true
     db_required: true
     artifacts_required: true
-    exchange_ping: false
+    exchange_ping: true
     max_candle_age_seconds: 7200
 execution:
   fee_bps: 10
-  entry_slippage_cap_pct: 0.0025
-  exit_slippage_cap_pct: 0.0025
-  max_spread_pct: 0.02
+  entry_slippage_cap_pct: 0.001
+  exit_slippage_cap_pct: 0.0015
+  max_spread_pct: 0.006
 risk:
-  max_positions: 3
+  max_positions: 1
   cooldown_s: 0
-  max_notional_per_trade_usd: 2000
-  max_position_notional_usd: 3000
-  max_daily_loss_usd: 100000
-  max_orders_per_minute: 9999
+  max_notional_per_trade_usd: 25
+  max_position_notional_usd: 50
+  max_daily_loss_usd: 25
+  max_orders_per_minute: 4
+  max_total_exposure_usd: 50
+  cooldown_minutes_per_symbol: 180
 strategies:
   algo1_new_listing_pump:
-    enabled: true
+    enabled: false
     max_listing_age_s: 300
     pump_trigger_bps: 20
     max_spread_pct: 0.05
@@ -188,7 +190,7 @@ ml_replay:
   ensemble_agreement_boost: 0.05
 ml_live:
   enabled: true
-  mode: shadow
+  mode: live
   prediction_source: ensemble
   predictions_table: spike_model_predictions_v50_sig_importance_ensemble
   score_column: null
@@ -215,8 +217,8 @@ ml_live:
   enable_dynamic_max_positions: true
   min_dynamic_max_positions: 1
   dynamic_position_score_threshold: 0.15
-  notional_per_trade: 500.0
-  min_notional_per_trade: 25.0
+  notional_per_trade: 25.0
+  min_notional_per_trade: 5.0
   enable_dynamic_sizing: true
   prob_size_cap: 2.5
   vol_reference: 0.006
@@ -237,12 +239,12 @@ ml_live:
   time_stop_hours: null
   time_stop_min_return_pct: 0.01
   enable_risk_manager: true
-  max_daily_loss_usd: 4000
-  max_total_exposure_usd: 20000
+  max_daily_loss_usd: 25
+  max_total_exposure_usd: 50
   max_total_exposure_pct: null
-  max_exposure_per_symbol_usd: 7000
+  max_exposure_per_symbol_usd: 50
   max_drawdown_pct: 0.08
-  cooldown_minutes_per_symbol: 120
+  cooldown_minutes_per_symbol: 180
   enable_drawdown_scaling: true
   drawdown_full_size_pct: 0.04
   drawdown_half_size_pct: 0.06
@@ -264,36 +266,29 @@ ml_live:
   min_ready_bars: 168
   use_centralized_feature_state: true
   evaluation_interval_s: 1
-
-  # Phase 5.8.5 inference throttling. This gates expensive feature/predict/rank/persist
-  # work before it happens, instead of only suppressing final signal emission.
   throttle_inference: true
   inference_interval_s: 60
   inference_on_candle_close_only: false
-
-  # Phase 5.8.5 signal stabilization / paper-readiness controls.
   suppress_duplicate_signals: true
-  min_signal_interval_seconds: 900
+  min_signal_interval_seconds: 1800
   min_prob_delta: 0.02
   min_score_delta: 0.15
-  max_shadow_signals_per_hour: 20
+  max_shadow_signals_per_hour: 6
   signal_on_candle_close_only: true
-
   probability_clip_min: 0.0
   probability_clip_max: 0.95
   confidence_dampening_factor: 0.75
   percentile_smoothing_window: 100
-
-  order_notional_buffer: 0.98
+  order_notional_buffer: 0.97
   predictor_mode: heuristic
   regime_scale_threshold: 0.7
   regime_scale_min_multiplier: 0.2
 execution_live:
-  broker: paper
   enabled: true
+  broker: live
   provider: ${EXECUTION_PROVIDER:-alpaca}
-  mode: ${EXECUTION_MODE:-paper}
-  base_url: https://paper-api.alpaca.markets
+  mode: ${EXECUTION_MODE:-live}
+  base_url: ${ALPACA_BASE_URL:-https://api.alpaca.markets}
   exchange_info_url: null
   api_key_env: ALPACA_API_KEY
   api_secret_env: ALPACA_API_SECRET
@@ -306,7 +301,7 @@ execution_live:
   default_tif: IOC
   alpaca_qty_step: 1.0e-06
   alpaca_price_tick: 0.01
-  starting_cash: 10000
+  starting_cash: 100.0
   dry_run_fill_policy: fill_immediately
   force_test_order_enabled: false
   force_test_order_symbol: ETHUSDT
@@ -315,9 +310,9 @@ execution_live:
   force_test_auto_exit_enabled: false
   force_test_auto_exit_delay_s: 15
   force_test_auto_exit_discount_bps: 10
-  cash_order_buffer: 0.995
+  cash_order_buffer: 0.97
   position_qty_buffer: 0.995
-  order_notional_buffer: 0.995
+  order_notional_buffer: 0.97
   tradable_symbols:
   - BTCUSDT
   - ETHUSDT
@@ -325,6 +320,10 @@ execution_live:
   close_all_price_mode: aggressive_limit
   close_all_slippage_pct: 0.01
   flatten_on_shutdown: true
+  startup_ping_required: true
+  account_status_required:
+  - ACTIVE
+  min_cash_usd: 25.0
 market_data:
   mode: rest_poll
   prefer_ws: false
@@ -344,60 +343,60 @@ safety:
   health_loop_interval_s: 5.0
   kill_switch:
     enabled: true
-    max_drawdown_pct: 0.1
-    max_daily_loss_usd: 5000
-    flatten_positions_on_trigger: false
+    max_drawdown_pct: 0.03
+    max_daily_loss_usd: 25
+    flatten_positions_on_trigger: true
     allow_exit_orders: true
-    max_api_errors_per_minute: 25
-    max_order_rejections_per_minute: 20
-    stale_data_kill_seconds: 300
+    max_api_errors_per_minute: 8
+    max_order_rejections_per_minute: 3
+    stale_data_kill_seconds: 120
   safe_mode:
     enabled: true
-    drawdown_warn_pct: 0.05
-    size_multiplier: 0.5
+    drawdown_warn_pct: 0.015
+    size_multiplier: 0.25
     max_positions_multiplier: 0.5
     cooldown_minutes_multiplier: 2.0
     disable_ml_entries: false
     disable_new_entries: false
-    auto_recover: true
-    recover_after_minutes: 30
+    auto_recover: false
+    recover_after_minutes: 120
   stale_data:
     enabled: true
-    max_candle_age_seconds: 120
-    max_feature_age_seconds: 300
-    max_prediction_age_seconds: 300
-    max_book_age_seconds: 30
-    max_ws_heartbeat_age_seconds: 60
+    max_candle_age_seconds: 60
+    max_feature_age_seconds: 180
+    max_prediction_age_seconds: 180
+    max_book_age_seconds: 15
+    max_ws_heartbeat_age_seconds: 30
   health:
     enabled: true
-    api_error_warn_threshold: 10
-    api_error_kill_threshold: 25
+    api_error_warn_threshold: 3
+    api_error_kill_threshold: 8
     ws_disconnect_warn_threshold: 5
     ws_disconnect_kill_threshold: 20
-    prediction_error_warn_threshold: 10
-    prediction_error_kill_threshold: 25
-    order_rejection_warn_threshold: 10
-    order_rejection_kill_threshold: 20
+    prediction_error_warn_threshold: 3
+    prediction_error_kill_threshold: 8
+    order_rejection_warn_threshold: 1
+    order_rejection_kill_threshold: 3
     fallback_prediction_warn_threshold: 5
     fallback_prediction_kill_threshold: 25
 monitoring:
   enabled: true
   heartbeat:
     enabled: true
-    interval_seconds: 15
+    interval_seconds: 10
   metrics:
     enabled: true
-    snapshot_interval_seconds: 30
+    snapshot_interval_seconds: 15
     persist_metrics: true
   reporting:
     enabled: true
     summary_interval_seconds: 120
 rollout:
-  stage: 0
-  name: paper_shadow_default
-  description: Safe default; no true live execution from base config.
+  stage: 2
+  name: stage_2_tiny_live
+  description: 'Controlled live rollout: strict caps, 1-2 symbols, supervised only'
   operator_ack_required: true
-  created_for_phase: "5.9"
+  created_for_phase: '5.9'
 live_startup:
   require_live_confirm: true
   confirm_env_var: TRADAR_CONFIRM_LIVE
@@ -408,10 +407,8 @@ live_startup:
   fail_if_previous_safe_mode: true
   fail_if_artifacts_missing: true
   fail_if_health_unhealthy: true
-  required_env_vars: []
+  required_env_vars:
+  - ALPACA_API_KEY
+  - ALPACA_API_SECRET
   allowed_profiles:
-    - paper
-    - shadow
-    - dry_run
-    - dry_run_live
-    - live
+  - live

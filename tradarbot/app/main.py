@@ -4,7 +4,7 @@ import os
 import re
 import time
 import httpx
-from typing import Any, Dict, Set
+from typing import Any, Dict, List, Optional, Set
 
 import yaml
 import pandas as pd
@@ -81,6 +81,129 @@ def setup_logging(level: str) -> None:
     )
 
 
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _runtime_mode(cfg: Dict[str, Any]) -> str:
+    runtime = cfg.get("runtime", {}) or {}
+    exec_cfg = cfg.get("execution_live", {}) or {}
+    ml_live = cfg.get("ml_live", {}) or {}
+    profile = str(runtime.get("profile", "paper") or "paper").lower().replace("-", "_")
+    broker = str(exec_cfg.get("broker", "paper") or "paper").lower().replace("-", "_")
+    ml_mode = str(ml_live.get("mode", "") or "").lower().replace("-", "_")
+    if profile == "live":
+        return "live"
+    if broker in {"dry_run_live", "dryrun"} or profile in {"dry_run", "dry_run_live"}:
+        return "dry_run_live"
+    if ml_mode == "shadow" or profile == "shadow":
+        return "shadow"
+    return "paper"
+
+
+def _persist_startup_event(store, event_type: str, severity: str, message: str, details: Optional[Dict[str, Any]] = None) -> None:
+    if store is None or not hasattr(store, "insert_runtime_status_event"):
+        return
+    try:
+        store.insert_runtime_status_event(
+            ts_ms=int(time.time() * 1000),
+            event_type=event_type,
+            severity=severity,
+            message=message,
+            details=details or {},
+        )
+    except Exception:
+        logging.getLogger("tradarbot").exception("STARTUP_EVENT_PERSIST_FAILED event_type=%s", event_type)
+
+
+def _startup_block(reason: str, *, store=None, details: Optional[Dict[str, Any]] = None) -> None:
+    log = logging.getLogger("tradarbot")
+    log.error("LIVE_STARTUP_BLOCKED reason=%s details=%s", reason, details or {})
+    _persist_startup_event(store, "live_startup_blocked", "KILL_SWITCH", reason, details)
+    raise RuntimeError(f"LIVE_STARTUP_BLOCKED reason={reason}")
+
+
+def _check_required_artifacts(cfg: Dict[str, Any]) -> List[str]:
+    runtime = cfg.get("runtime", {}) or {}
+    ml_live = cfg.get("ml_live", {}) or {}
+    artifact_dir = os.environ.get("TRADAR_ARTIFACT_DIR") or runtime.get("artifact_dir") or ml_live.get("artifact_dir")
+    if not artifact_dir:
+        return ["artifact_dir_not_configured"]
+    required = ml_live.get("required_artifacts") or ["model_6h.joblib", "model_24h.joblib", "model_72h.joblib"]
+    missing = []
+    for name in required:
+        if not os.path.exists(os.path.join(str(artifact_dir), str(name))):
+            missing.append(str(name))
+    return missing
+
+
+def validate_startup_sanity(cfg: Dict[str, Any], store, kill_switch, safe_mode, health_monitor, broker=None) -> None:
+    """Phase 5.9 fail-closed startup validation.
+
+    This only hard-blocks true live mode. Paper, shadow, and dry_run_live remain
+    backward-compatible and log warnings/events instead of raising.
+    """
+    log = logging.getLogger("tradarbot")
+    mode = _runtime_mode(cfg)
+    runtime = cfg.get("runtime", {}) or {}
+    exec_cfg = cfg.get("execution_live", {}) or {}
+    rollout = cfg.get("rollout", {}) or {}
+    startup = cfg.get("live_startup", {}) or {}
+
+    log.warning(
+        "STARTUP_MODE_BANNER mode=%s profile=%s rollout_stage=%s execution_enabled=%s broker=%s provider=%s exec_mode=%s",
+        mode,
+        runtime.get("profile"),
+        rollout.get("stage", "n/a"),
+        exec_cfg.get("enabled"),
+        exec_cfg.get("broker"),
+        exec_cfg.get("provider"),
+        exec_cfg.get("mode"),
+    )
+    _persist_startup_event(
+        store,
+        "startup_mode_banner",
+        "WARN" if mode == "live" else "OK",
+        f"runtime_mode={mode}",
+        {"runtime": runtime, "execution_live": exec_cfg, "rollout": rollout},
+    )
+
+    if mode != "live":
+        return
+
+    if startup.get("fail_if_previous_kill_switch", True):
+        previous = store.latest_safety_snapshot() if hasattr(store, "latest_safety_snapshot") else None
+        if previous and bool(previous.get("kill_switch")):
+            _startup_block("previous_kill_switch_active", store=store, details=previous)
+
+    if startup.get("fail_if_previous_safe_mode", True):
+        previous = store.latest_safety_snapshot() if hasattr(store, "latest_safety_snapshot") else None
+        if previous and bool(previous.get("safe_mode")):
+            _startup_block("previous_safe_mode_active", store=store, details=previous)
+
+    if startup.get("fail_if_artifacts_missing", True):
+        missing = _check_required_artifacts(cfg)
+        if missing:
+            _startup_block("artifacts_missing", store=store, details={"missing": missing})
+
+    if health_monitor is not None and startup.get("fail_if_health_unhealthy", True):
+        try:
+            evaluation = health_monitor.evaluate(None)
+            status = getattr(evaluation, "status", None)
+            if status in {STATUS_KILL_SWITCH, STATUS_SAFE_MODE}:
+                _startup_block("health_monitor_unhealthy", store=store, details={"status": status})
+        except Exception as exc:
+            _startup_block("health_monitor_eval_failed", store=store, details={"error": str(exc)})
+
+    if broker is not None and hasattr(broker, "validate_startup"):
+        broker.validate_startup()
+
+    log.warning("LIVE_STARTUP_CHECK_OK rollout_stage=%s provider=%s broker=%s", rollout.get("stage"), exec_cfg.get("provider"), exec_cfg.get("broker"))
+    _persist_startup_event(store, "live_startup_check_ok", "OK", "live startup sanity checks passed", {"rollout": rollout})
+
+
 async def main() -> None:
     cfg: Dict[str, Any] = load_runtime_config()
     setup_logging(cfg.get("runtime", {}).get("log_level", "INFO"))
@@ -121,6 +244,8 @@ async def main() -> None:
     ctx.safe_mode = safe_mode
     ctx.stale_guard = stale_guard
     ctx.health_monitor = health_monitor
+
+    validate_startup_sanity(cfg, store, kill_switch, safe_mode, health_monitor, broker=broker)
 
     # Phase 5.7 monitoring layer: lightweight, SQLite-backed, failure-isolated.
     process_start_ts = time.time()
